@@ -1,0 +1,84 @@
+<?xml version="1.0"?>
+<!-- Sample SSIS 2012+ package (hand-written) used by the test suite.
+     Covers: Sequence container, Execute SQL with SingleRow result set,
+     a Data Flow with a Lookup (-> Mapping Data Flow), an Azure SQL target
+     and a failure-path precedence constraint. -->
+<DTS:Executable xmlns:DTS="www.microsoft.com/SqlServer/Dts" DTS:refId="Package" DTS:CreationName="Microsoft.Package" DTS:ExecutableType="Microsoft.Package" DTS:ObjectName="CargaClientes" DTS:DTSID="{A0000000-0000-0000-0000-000000000001}" DTS:PackageFormatVersion="8">
+  <DTS:ConnectionManagers>
+    <DTS:ConnectionManager DTS:refId="Package.ConnectionManagers[CRM]" DTS:CreationName="OLEDB" DTS:ObjectName="CRM" DTS:DTSID="{C0000000-0000-0000-0000-000000000001}">
+      <DTS:ObjectData><DTS:ConnectionManager DTS:ConnectionString="Data Source=srvcrm;Initial Catalog=CRM;Provider=SQLNCLI11.1;Integrated Security=SSPI;"/></DTS:ObjectData>
+    </DTS:ConnectionManager>
+    <DTS:ConnectionManager DTS:refId="Package.ConnectionManagers[AzureDW]" DTS:CreationName="OLEDB" DTS:ObjectName="AzureDW" DTS:DTSID="{C0000000-0000-0000-0000-000000000002}">
+      <DTS:ObjectData><DTS:ConnectionManager DTS:ConnectionString="Data Source=midw.database.windows.net;Initial Catalog=DW;Provider=MSOLEDBSQL.1;"/></DTS:ObjectData>
+    </DTS:ConnectionManager>
+  </DTS:ConnectionManagers>
+  <DTS:Executables>
+    <DTS:Executable DTS:refId="Package\Obtener Fecha Corte" DTS:CreationName="Microsoft.ExecuteSQLTask" DTS:ExecutableType="Microsoft.ExecuteSQLTask" DTS:ObjectName="Obtener Fecha Corte" DTS:DTSID="{E0000000-0000-0000-0000-000000000001}">
+      <DTS:ObjectData><SQLTask:SqlTaskData xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask" SQLTask:Connection="{C0000000-0000-0000-0000-000000000002}" SQLTask:SqlStatementSource="SELECT MAX(FechaCarga) AS FechaCorte FROM ctl.Cargas" SQLTask:ResultType="ResultSetType_SingleRow"/></DTS:ObjectData>
+    </DTS:Executable>
+    <DTS:Executable DTS:refId="Package\Carga" DTS:CreationName="STOCK:SEQUENCE" DTS:ExecutableType="STOCK:SEQUENCE" DTS:ObjectName="Carga" DTS:DTSID="{E0000000-0000-0000-0000-000000000002}">
+      <DTS:Executables>
+        <DTS:Executable DTS:refId="Package\Carga\Limpiar Stage" DTS:CreationName="Microsoft.ExecuteSQLTask" DTS:ExecutableType="Microsoft.ExecuteSQLTask" DTS:ObjectName="Limpiar Stage" DTS:DTSID="{E0000000-0000-0000-0000-000000000003}">
+          <DTS:ObjectData><SQLTask:SqlTaskData xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask" SQLTask:Connection="{C0000000-0000-0000-0000-000000000002}" SQLTask:SqlStatementSource="TRUNCATE TABLE stg.Clientes"/></DTS:ObjectData>
+        </DTS:Executable>
+        <DTS:Executable DTS:refId="Package\Carga\Cargar Clientes" DTS:CreationName="Microsoft.Pipeline" DTS:ExecutableType="Microsoft.Pipeline" DTS:ObjectName="Cargar Clientes" DTS:DTSID="{E0000000-0000-0000-0000-000000000004}">
+          <DTS:ObjectData>
+            <pipeline version="1">
+              <components>
+                <component refId="Package\Carga\Cargar Clientes\Origen CRM" componentClassID="Microsoft.OLEDBSource" name="Origen CRM">
+                  <properties>
+                    <property name="SqlCommand">SELECT IdCliente, Nombre, IdPais FROM dbo.Clientes</property>
+                    <property name="AccessMode">2</property>
+                  </properties>
+                  <connections>
+                    <connection refId="Package\Carga\Cargar Clientes\Origen CRM.Connections[OleDbConnection]" connectionManagerID="Package.ConnectionManagers[CRM]" connectionManagerRefId="Package.ConnectionManagers[CRM]" name="OleDbConnection"/>
+                  </connections>
+                  <outputs>
+                    <output refId="Package\Carga\Cargar Clientes\Origen CRM.Outputs[OLE DB Source Output]" name="OLE DB Source Output">
+                      <outputColumns>
+                        <outputColumn refId="o1" dataType="i4" name="IdCliente"/>
+                        <outputColumn refId="o2" dataType="wstr" length="100" name="Nombre"/>
+                        <outputColumn refId="o3" dataType="i4" name="IdPais"/>
+                      </outputColumns>
+                    </output>
+                  </outputs>
+                </component>
+                <component refId="Package\Carga\Cargar Clientes\Buscar Pais" componentClassID="Microsoft.Lookup" name="Buscar Pais">
+                  <properties>
+                    <property name="SqlCommand">SELECT IdPais, NombrePais FROM dbo.Paises</property>
+                  </properties>
+                  <connections>
+                    <connection refId="Package\Carga\Cargar Clientes\Buscar Pais.Connections[OleDbConnection]" connectionManagerID="Package.ConnectionManagers[CRM]" connectionManagerRefId="Package.ConnectionManagers[CRM]" name="OleDbConnection"/>
+                  </connections>
+                </component>
+                <component refId="Package\Carga\Cargar Clientes\Destino DW" componentClassID="Microsoft.OLEDBDestination" name="Destino DW">
+                  <properties>
+                    <property name="OpenRowset">[stg].[Clientes]</property>
+                    <property name="AccessMode">3</property>
+                  </properties>
+                  <connections>
+                    <connection refId="Package\Carga\Cargar Clientes\Destino DW.Connections[OleDbConnection]" connectionManagerID="Package.ConnectionManagers[AzureDW]" connectionManagerRefId="Package.ConnectionManagers[AzureDW]" name="OleDbConnection"/>
+                  </connections>
+                </component>
+              </components>
+              <paths>
+                <path refId="Package\Carga\Cargar Clientes.Paths[p1]" startId="Package\Carga\Cargar Clientes\Origen CRM.Outputs[OLE DB Source Output]" endId="Package\Carga\Cargar Clientes\Buscar Pais.Inputs[Lookup Input]" name="p1"/>
+                <path refId="Package\Carga\Cargar Clientes.Paths[p2]" startId="Package\Carga\Cargar Clientes\Buscar Pais.Outputs[Lookup Match Output]" endId="Package\Carga\Cargar Clientes\Destino DW.Inputs[OLE DB Destination Input]" name="p2"/>
+              </paths>
+            </pipeline>
+          </DTS:ObjectData>
+        </DTS:Executable>
+      </DTS:Executables>
+      <DTS:PrecedenceConstraints>
+        <DTS:PrecedenceConstraint DTS:refId="Package\Carga.PrecedenceConstraints[c_in]" DTS:CreationName="" DTS:DTSID="{F0000000-0000-0000-0000-000000000002}" DTS:From="Package\Carga\Limpiar Stage" DTS:To="Package\Carga\Cargar Clientes" DTS:ObjectName="c_in"/>
+      </DTS:PrecedenceConstraints>
+    </DTS:Executable>
+    <DTS:Executable DTS:refId="Package\Registrar Error" DTS:CreationName="Microsoft.ExecuteSQLTask" DTS:ExecutableType="Microsoft.ExecuteSQLTask" DTS:ObjectName="Registrar Error" DTS:DTSID="{E0000000-0000-0000-0000-000000000005}">
+      <DTS:ObjectData><SQLTask:SqlTaskData xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask" SQLTask:Connection="{C0000000-0000-0000-0000-000000000002}" SQLTask:SqlStatementSource="EXEC ctl.RegistrarError 'CargaClientes'"/></DTS:ObjectData>
+    </DTS:Executable>
+  </DTS:Executables>
+  <DTS:PrecedenceConstraints>
+    <DTS:PrecedenceConstraint DTS:refId="Package.PrecedenceConstraints[c1]" DTS:CreationName="" DTS:DTSID="{F0000000-0000-0000-0000-000000000001}" DTS:From="Package\Obtener Fecha Corte" DTS:To="Package\Carga" DTS:ObjectName="c1"/>
+    <DTS:PrecedenceConstraint DTS:refId="Package.PrecedenceConstraints[c2]" DTS:CreationName="" DTS:DTSID="{F0000000-0000-0000-0000-000000000003}" DTS:From="Package\Carga" DTS:To="Package\Registrar Error" DTS:Value="1" DTS:ObjectName="c2"/>
+  </DTS:PrecedenceConstraints>
+</DTS:Executable>

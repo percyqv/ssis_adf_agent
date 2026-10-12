@@ -17,12 +17,15 @@ from __future__ import annotations
 from typing import Any
 
 from ...parsers.models import (
+    DataFlowComponent,
     DataFlowTask,
     IngestionPattern,
     PrecedenceConstraint,
+    SSISConnectionManager,
     SSISTask,
 )
 from ..base_converter import BaseConverter
+from ..sql_flavor import flavor_for
 
 # Component types treated as "pure source"
 _SOURCE_TYPES = frozenset({
@@ -54,7 +57,30 @@ def _is_simple_copy(task: DataFlowTask) -> bool:
     return len(sources) == 1 and len(dests) == 1 and len(transforms) == 0
 
 
+def _source_query(src: DataFlowComponent | None) -> str | None:
+    """SQL text of an OLE DB / ADO.NET source in "SQL command" mode, if any.
+
+    OLE DB Source AccessMode: 0=table, 1=table from variable, 2=SQL command,
+    3=SQL command from variable.
+    """
+    if src is None:
+        return None
+    sql = (src.properties.get("SqlCommand") or "").strip()
+    mode = str(src.properties.get("AccessMode") or "")
+    if sql and mode in ("", "2"):
+        return sql
+    if mode == "3":
+        var = src.properties.get("SqlCommandVariable") or "TODO"
+        return f"/* TODO: SSIS read this query from variable {var}; map it to a pipeline parameter */"
+    return None
+
+
 class DataFlowConverter(BaseConverter):
+    def __init__(
+        self, connections_by_id: dict[str, SSISConnectionManager] | None = None
+    ) -> None:
+        self._connections_by_id = connections_by_id or {}
+
     def convert(
         self,
         task: SSISTask,
@@ -76,6 +102,9 @@ class DataFlowConverter(BaseConverter):
         src = next((c for c in task.components if c.component_type in _SOURCE_TYPES), None)
         dst = next((c for c in task.components if c.component_type in _DEST_TYPES), None)
 
+        src_flavor = flavor_for(src.connection_id if src else None, self._connections_by_id)
+        dst_flavor = flavor_for(dst.connection_id if dst else None, self._connections_by_id)
+
         src_ds = f"DS_{src.name.replace(' ', '_')}" if src else f"DS_src_{safe_name}"
         dst_ds = f"DS_{dst.name.replace(' ', '_')}" if dst else f"DS_dst_{safe_name}"
 
@@ -93,7 +122,7 @@ class DataFlowConverter(BaseConverter):
         ):
             # Upsert pattern with native temp table
             sink = {
-                "type": "AzureSqlSink",
+                "type": dst_flavor.sink_type,
                 "writeBehavior": "upsert",
                 "upsertSettings": {
                     "useTempDB": True,
@@ -104,7 +133,7 @@ class DataFlowConverter(BaseConverter):
         elif ingestion == IngestionPattern.DELTA:
             # Delta without detected keys — upsert with placeholder
             sink = {
-                "type": "AzureSqlSink",
+                "type": dst_flavor.sink_type,
                 "writeBehavior": "upsert",
                 "upsertSettings": {
                     "useTempDB": True,
@@ -115,12 +144,21 @@ class DataFlowConverter(BaseConverter):
         else:
             # Full load — insert with auto-create
             sink = {
-                "type": "AzureSqlSink",
+                "type": dst_flavor.sink_type,
                 "writeBehavior": "insert",
                 "tableOption": "autoCreate",
                 "writeBatchSize": 100000,
                 "sqlWriterUseTableLock": False,
             }
+
+        source: dict[str, Any] = {
+            "type": src_flavor.source_type,
+            "queryTimeout": "02:00:00",
+            "isolationLevel": "ReadUncommitted",
+        }
+        query = _source_query(src)
+        if query:
+            source["sqlReaderQuery"] = query
 
         return {
             "name": task.name,
@@ -135,11 +173,7 @@ class DataFlowConverter(BaseConverter):
                 "secureInput": False,
             },
             "typeProperties": {
-                "source": {
-                    "type": "AzureSqlSource",
-                    "queryTimeout": "02:00:00",
-                    "isolationLevel": "ReadUncommitted",
-                },
+                "source": source,
                 "sink": sink,
                 "enableStaging": False,
                 "translator": {"type": "TabularTranslator", "typeConversion": True},

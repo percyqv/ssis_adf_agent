@@ -10,10 +10,13 @@ import json
 from pathlib import Path
 from typing import Any
 
+from ..converters.control_flow.execute_sql_converter import normalize_result_type
+from ..converters.sql_flavor import flavor_for
 from ..parsers.models import (
     ConnectionManagerType,
     DataFlowComponent,
     DataFlowTask,
+    ExecuteSQLTask,
     SSISConnectionManager,
     SSISPackage,
     TaskType,
@@ -112,6 +115,15 @@ def _build_dataset(
     return {"name": name, "properties": props}
 
 
+def _walk_tasks(tasks: list[Any]):
+    """Yield tasks recursively, descending into containers (Sequence/ForEach/For)."""
+    for t in tasks:
+        yield t
+        children = getattr(t, "tasks", None)
+        if children:
+            yield from _walk_tasks(children)
+
+
 def generate_datasets(
     package: SSISPackage,
     output_dir: Path,
@@ -143,7 +155,29 @@ def generate_datasets(
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
 
-    for task in package.tasks:
+    def _write(ds: dict[str, Any]) -> None:
+        (ds_dir / f"{ds['name']}.json").write_text(
+            json.dumps(ds, indent=4, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        results.append(ds)
+
+    for task in _walk_tasks(package.tasks):
+        # Execute SQL tasks with a result set become Lookup activities, which
+        # need a dataset bound to the task's connection (the query overrides it).
+        if isinstance(task, ExecuteSQLTask):
+            if normalize_result_type(task.result_set_type) in ("SingleRow", "FullResultSet"):
+                ds_name = f"DS_{task.name.replace(' ', '_')}"
+                if ds_name not in seen and ds_name not in existing_ds:
+                    seen.add(ds_name)
+                    _write(_build_dataset(
+                        name=ds_name,
+                        ds_type=flavor_for(task.connection_id, conn_by_id).dataset_type,
+                        linked_service_name=f"LS_{task.connection_id or 'unknown'}",
+                        description=f"Dataset for SSIS Execute SQL Task (Lookup): {task.name}",
+                    ))
+            continue
+
         if task.task_type != TaskType.DATA_FLOW:
             continue
         assert isinstance(task, DataFlowTask)
@@ -152,6 +186,9 @@ def generate_datasets(
             ds_type = _COMP_TO_DS_TYPE.get(comp.component_type)
             if ds_type is None:
                 continue  # transformation — no dataset needed
+            if ds_type == "AzureSqlTable":
+                # OLE DB / ADO.NET: SQL Server on-prem vs Azure SQL by connection
+                ds_type = flavor_for(comp.connection_id, conn_by_id).dataset_type
 
             ds_name = f"DS_{comp.name.replace(' ', '_')}"
             if ds_name in seen or ds_name in existing_ds:
@@ -166,7 +203,7 @@ def generate_datasets(
             )
             file_path = conn.file_path if conn else None
 
-            ds = _build_dataset(
+            _write(_build_dataset(
                 name=ds_name,
                 ds_type=ds_type,
                 linked_service_name=ls_name,
@@ -174,11 +211,6 @@ def generate_datasets(
                 file_path=file_path,
                 description=f"Dataset for SSIS component: {comp.name}",
                 schema_remap=schema_remap,
-            )
-            (ds_dir / f"{ds_name}.json").write_text(
-                json.dumps(ds, indent=4, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            results.append(ds)
+            ))
 
     return results

@@ -99,6 +99,97 @@ CLSID_MAP: dict[str, str] = {
     "{ACA08B87-CCDE-4BA4-BFBF-09AC42891D56}": "SqlServerDestination",
 }
 
+# Same map keyed without braces, upper-case (the form used for lookups).
+_CLSID_LOOKUP: dict[str, str] = {k.strip("{}").upper(): v for k, v in CLSID_MAP.items()}
+
+# SSIS 2012+ (PackageFormatVersion >= 6) stores componentClassID as a ProgID
+# such as "Microsoft.OLEDBSource" instead of a GUID.
+PROGID_MAP: dict[str, str] = {
+    "Microsoft.OLEDBSource": "OleDbSource",
+    "Microsoft.OLEDBDestination": "OleDbDestination",
+    "Microsoft.FlatFileSource": "FlatFileSource",
+    "Microsoft.FlatFileDestination": "FlatFileDestination",
+    "Microsoft.ExcelSource": "ExcelSource",
+    "Microsoft.ExcelDestination": "ExcelDestination",
+    "Microsoft.SSISODBCSrc": "OdbcSource",
+    "Microsoft.SSISODBCDst": "OdbcDestination",
+    "Microsoft.SQLServerDestination": "SqlServerDestination",
+    "Microsoft.RecordsetDestination": "RecordsetDestination",
+    "Microsoft.Lookup": "Lookup",
+    "Microsoft.DerivedColumn": "DerivedColumn",
+    "Microsoft.ConditionalSplit": "ConditionalSplit",
+    "Microsoft.Multicast": "Multicast",
+    "Microsoft.UnionAll": "UnionAll",
+    "Microsoft.Aggregate": "Aggregate",
+    "Microsoft.Sort": "Sort",
+    "Microsoft.MergeJoin": "MergeJoin",
+    "Microsoft.Merge": "Merge",
+    "Microsoft.DataConvert": "DataConversion",
+    "Microsoft.CharacterMap": "CharacterMap",
+    "Microsoft.RowCount": "RowCount",
+    "Microsoft.CopyMap": "CopyColumn",
+    "Microsoft.OLEDBCommand": "OleDbCommand",
+    "Microsoft.SCD": "SlowlyChangingDimension",
+    "Microsoft.Pivot": "Pivot",
+    "Microsoft.UnPivot": "Unpivot",
+    "Microsoft.PctSampling": "PercentageSampling",
+    "Microsoft.RowSampling": "RowSampling",
+    "Microsoft.FuzzyLookup": "FuzzyLookup",
+    "Microsoft.FuzzyGrouping": "FuzzyGrouping",
+    "Microsoft.TermExtraction": "TermExtraction",
+    "Microsoft.TermLookup": "TermLookup",
+    "Microsoft.Cache": "Cache",
+}
+
+# Managed components share componentClassID "Microsoft.ManagedComponentHost";
+# the real type is in the UserComponentTypeName property.
+_MANAGED_COMPONENT_MAP: dict[str, str] = {
+    "ScriptComponentHost": "ScriptComponent",
+    "DataReaderSourceAdapter": "ADONetSource",
+    "ADONETDestination": "ADONetDestination",
+    "ADONETSource": "ADONetSource",
+}
+
+
+def resolve_component_type(class_id: str, properties: dict[str, Any] | None = None) -> str:
+    """Map a Data Flow componentClassID (GUID or ProgID) to a component type name."""
+    cid = (class_id or "").strip()
+    if not cid:
+        return "Unknown"
+    if cid in PROGID_MAP:
+        return PROGID_MAP[cid]
+    if cid.lower() == "microsoft.managedcomponenthost":
+        user_type = str((properties or {}).get("UserComponentTypeName") or "")
+        for marker, comp_type in _MANAGED_COMPONENT_MAP.items():
+            if marker.lower() in user_type.lower():
+                return comp_type
+        return "ScriptComponent" if not user_type else user_type
+    return _CLSID_LOOKUP.get(cid.strip("{}").upper(), cid)
+
+
+def _local(elem: etree._Element) -> str:
+    tag = elem.tag
+    return etree.QName(tag).localname if isinstance(tag, str) else ""
+
+
+def _children_local(elem: etree._Element, name: str) -> list[etree._Element]:
+    """Direct children with the given local name, in any (or no) namespace."""
+    return [c for c in elem if _local(c) == name]
+
+
+def _first_child_local(elem: etree._Element, name: str) -> etree._Element | None:
+    for c in elem:
+        if _local(c) == name:
+            return c
+    return None
+
+
+def _iter_local(elem: etree._Element, name: str):
+    """Descendants (including elem) with the given local name, in any namespace."""
+    for e in elem.iter():
+        if _local(e) == name:
+            yield e
+
 
 def _tag(ns: str, local: str) -> str:
     return f"{{{ns}}}{local}"
@@ -451,7 +542,15 @@ class SSISParser:
         }
         protection = protection_map.get(protection_str, ProtectionLevel.DONT_SAVE_SENSITIVE)
 
+        # Per-package lookup tables used to resolve SSIS 2012+ refId references
+        self._exec_ref_map: dict[str, str] = {}
+        self._cm_ref_ids: dict[str, str] = {}
         connection_managers = self._parse_connection_managers(root)
+        self._cm_lookup: dict[str, str] = dict(self._cm_ref_ids)
+        for cm in connection_managers:
+            self._cm_lookup[cm.id] = cm.id
+            self._cm_lookup[cm.name] = cm.id
+            self._cm_lookup[f"Package.ConnectionManagers[{cm.name}]"] = cm.id
         variables = self._parse_variables(root, direct_children_only=True)
         parameters = self._parse_parameters(root)
         tasks, constraints = self._parse_executables(root)
@@ -489,6 +588,9 @@ class SSISParser:
         for cm_elem in cm_container.findall(_dts("ConnectionManager")):
             cm_id = _clean_id(_attr(cm_elem, "DTSID"))
             cm_name = _attr(cm_elem, "ObjectName") or cm_id
+            cm_ref = _attr(cm_elem, "refId")
+            if cm_ref and hasattr(self, "_cm_ref_ids"):
+                self._cm_ref_ids[cm_ref] = cm_id
             cm_type_str = _attr(cm_elem, "CreationName") or ""
 
             # Resolve type
@@ -648,6 +750,10 @@ class SSISParser:
         task_id = _clean_id(_attr(elem, "DTSID"))
         task_name = _attr(elem, "ObjectName") or task_id
         description = _attr(elem, "Description") or ""
+        ref_id = _attr(elem, "refId")
+        if ref_id:
+            self._exec_ref_map[ref_id] = task_id
+        self._exec_ref_map[task_id] = task_id
         disabled = (_attr(elem, "Disabled") or "0") not in ("0", "")
 
         base_kwargs = dict(
@@ -967,23 +1073,20 @@ class SSISParser:
         paths: list[DataFlowPath] = []
 
         if object_data is not None:
-            pipeline_ns = f"{{{PIPELINE_NS}}}"
             for pipeline in object_data.iter():
-                if etree.QName(pipeline.tag).localname not in ("pipeline", "Pipeline"):
+                if _local(pipeline) not in ("pipeline", "Pipeline"):
                     continue
-                components_elem = pipeline.find(f"{pipeline_ns}components") or pipeline.find("components")
+                components_elem = _first_child_local(pipeline, "components")
                 if components_elem is not None:
-                    for comp in components_elem.findall(f"{pipeline_ns}component") + \
-                                components_elem.findall("component"):
-                        dfc = self._parse_df_component(comp, pipeline_ns)
+                    for comp in _children_local(components_elem, "component"):
+                        dfc = self._parse_df_component(comp, "")
                         if dfc:
                             components.append(dfc)
 
-                paths_elem = pipeline.find(f"{pipeline_ns}paths") or pipeline.find("paths")
+                paths_elem = _first_child_local(pipeline, "paths")
                 if paths_elem is not None:
-                    for path_elem in paths_elem.findall(f"{pipeline_ns}path") + \
-                                     paths_elem.findall("path"):
-                        p_id = path_elem.get("id") or str(uuid.uuid4())
+                    for path_elem in _children_local(paths_elem, "path"):
+                        p_id = path_elem.get("id") or path_elem.get("refId") or str(uuid.uuid4())
                         p_name = path_elem.get("name") or p_id
                         start = path_elem.get("startId") or ""
                         end = path_elem.get("endId") or ""
@@ -1015,36 +1118,45 @@ class SSISParser:
     def _parse_df_component(
         self, comp: etree._Element, ns: str
     ) -> DataFlowComponent | None:
-        comp_id = comp.get("id") or str(uuid.uuid4())
+        comp_id = comp.get("id") or comp.get("refId") or str(uuid.uuid4())
         comp_name = comp.get("name") or comp_id
         class_id = comp.get("classID") or comp.get("componentClassID") or ""
-        comp_type = CLSID_MAP.get(class_id.strip("{}").upper(), class_id)
-        if not comp_type:
-            comp_type = comp.get("componentName") or "Unknown"
+
+        # Component-level properties only (not those of inputs/outputs/columns)
+        props: dict[str, Any] = {}
+        props_elem = _first_child_local(comp, "properties")
+        if props_elem is not None:
+            for prop in _children_local(props_elem, "property"):
+                pname = prop.get("name")
+                if pname:
+                    props[pname] = prop.text
+
+        comp_type = resolve_component_type(class_id, props)
+        if comp_type == "Unknown":
+            comp_type = comp.get("componentName") or comp.get("contactInfo") or "Unknown"
 
         conn_id: str | None = None
-        # Connection managers for this component
-        for cm_ref in comp.iter(f"{ns}connection"):
-            if cm_ref.get("id"):
-                conn_id = _clean_id(cm_ref.get("componentId") or cm_ref.get("id"))
+        # Connection manager used by this component
+        for cm_ref in _iter_local(comp, "connection"):
+            raw = (
+                cm_ref.get("connectionManagerRefId")
+                or cm_ref.get("connectionManagerID")
+                or cm_ref.get("componentId")
+            )
+            if raw:
+                conn_id = self._resolve_connection_ref(raw)
                 break
-
-        props: dict[str, Any] = {}
-        for prop in comp.iter(f"{ns}property"):
-            pname = prop.get("name")
-            if pname:
-                props[pname] = prop.text
 
         # Columns
         input_cols: list[DataFlowColumn] = []
         output_cols: list[DataFlowColumn] = []
 
-        for input_elem in comp.iter(f"{ns}input"):
-            for col in input_elem.iter(f"{ns}inputColumn"):
+        for input_elem in _iter_local(comp, "input"):
+            for col in _iter_local(input_elem, "inputColumn"):
                 input_cols.append(self._parse_df_column(col))
 
-        for output_elem in comp.iter(f"{ns}output"):
-            for col in output_elem.iter(f"{ns}outputColumn"):
+        for output_elem in _iter_local(comp, "output"):
+            for col in _iter_local(output_elem, "outputColumn"):
                 output_cols.append(self._parse_df_column(col))
 
         # Extract key columns from destination components (e.g., MERGE ON clause)
@@ -1085,6 +1197,32 @@ class SSISParser:
     # Precedence Constraints
     # ------------------------------------------------------------------
 
+    def _resolve_executable_ref(self, raw: str | None) -> str:
+        """Map a constraint endpoint (SSIS 2012+ refId path or a DTSID) to a task id."""
+        if raw:
+            ref_map = getattr(self, "_exec_ref_map", {})
+            if raw in ref_map:
+                return ref_map[raw]
+            cleaned = raw.strip("{}").upper()
+            if cleaned in ref_map:
+                return ref_map[cleaned]
+        return _clean_id(raw)
+
+    def _resolve_connection_ref(self, raw: str | None) -> str | None:
+        """Map a component's connectionManagerID / RefId to a connection manager id."""
+        if not raw:
+            return None
+        lookup = getattr(self, "_cm_lookup", {})
+        candidates = [raw, raw.split(":")[0], raw.split(":")[0].strip("{}").upper()]
+        for c in candidates:
+            if c in lookup:
+                return lookup[c]
+        # Project-level connection (Project.ConnectionManagers[X]) or unknown:
+        # keep the most readable identifier available.
+        if "[" in raw and raw.endswith("]"):
+            return raw[raw.index("[") + 1 : -1]
+        return candidates[2]
+
     def _parse_precedence_constraints(
         self, parent: etree._Element, tasks: list[SSISTask]
     ) -> list[PrecedenceConstraint]:
@@ -1095,8 +1233,8 @@ class SSISParser:
 
         for pc in pc_container.findall(_dts("PrecedenceConstraint")):
             pc_id = _clean_id(_attr(pc, "DTSID"))
-            from_id = _clean_id(_attr(pc, "From"))
-            to_id = _clean_id(_attr(pc, "To"))
+            from_id = self._resolve_executable_ref(_attr(pc, "From"))
+            to_id = self._resolve_executable_ref(_attr(pc, "To"))
             eval_op_str = _attr(pc, "EvalOp") or "1"
             eval_op_map = {
                 "1": PrecedenceEvalOp.CONSTRAINT,

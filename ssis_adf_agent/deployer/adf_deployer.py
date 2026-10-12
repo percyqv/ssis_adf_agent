@@ -205,4 +205,97 @@ class AdfDeployer:
             elif artifact_type == "pipeline" and "activities" not in payload.get("properties", {}):
                 issues.append({"file": str(json_file), "error": "Pipeline missing 'activities' array"})
 
+        issues.extend(_check_references(artifacts_dir))
         return issues
+
+
+# ---------------------------------------------------------------------------
+# Cross-artifact reference checks
+# ---------------------------------------------------------------------------
+
+_REF_FOLDERS = {
+    "DatasetReference": "dataset",
+    "LinkedServiceReference": "linkedService",
+    "DataFlowReference": "dataflow",
+    "PipelineReference": "pipeline",
+}
+
+
+def _iter_activity_lists(activities: list[Any]):
+    yield activities
+    for act in activities:
+        tp = act.get("typeProperties", {}) if isinstance(act, dict) else {}
+        for key in ("activities", "ifTrueActivities", "ifFalseActivities"):
+            if isinstance(tp.get(key), list):
+                yield from _iter_activity_lists(tp[key])
+        for case in tp.get("cases", []) or []:
+            if isinstance(case, dict) and isinstance(case.get("activities"), list):
+                yield from _iter_activity_lists(case["activities"])
+
+
+def _iter_references(node: Any):
+    if isinstance(node, dict):
+        ref_type = node.get("type")
+        if ref_type in _REF_FOLDERS and isinstance(node.get("referenceName"), str):
+            yield ref_type, node["referenceName"]
+        for v in node.values():
+            yield from _iter_references(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _iter_references(v)
+
+
+def _check_references(artifacts_dir: Path) -> list[dict[str, Any]]:
+    """Find dangling activity dependencies and references to artifacts that
+    were not generated (datasets, linked services, data flows, pipelines).
+
+    References to artifacts that live outside *artifacts_dir* (e.g. shared
+    linked services already deployed) are reported as warnings.
+    """
+    issues: list[dict[str, Any]] = []
+    present: dict[str, set[str]] = {}
+    payloads: list[tuple[Path, dict[str, Any]]] = []
+    for json_file in artifacts_dir.rglob("*.json"):
+        try:
+            payload = json.loads(json_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        rel = json_file.relative_to(artifacts_dir)
+        folder = rel.parts[0] if len(rel.parts) > 1 else ""
+        if isinstance(payload, dict) and "name" in payload:
+            present.setdefault(folder, set()).add(payload["name"])
+            payloads.append((json_file, payload))
+
+    for json_file, payload in payloads:
+        props = payload.get("properties", {})
+        if not isinstance(props, dict):
+            continue
+        acts = props.get("activities")
+        if isinstance(acts, list):
+            for scope in _iter_activity_lists(acts):
+                names = {a.get("name") for a in scope if isinstance(a, dict)}
+                for a in scope:
+                    if not isinstance(a, dict):
+                        continue
+                    for dep in a.get("dependsOn", []) or []:
+                        target = dep.get("activity")
+                        if target not in names:
+                            issues.append({
+                                "file": str(json_file),
+                                "error": (
+                                    f"Activity '{a.get('name')}' depends on '{target}', "
+                                    "which is not an activity in the same scope"
+                                ),
+                            })
+        for ref_type, ref_name in _iter_references(props):
+            folder = _REF_FOLDERS[ref_type]
+            if ref_name not in present.get(folder, set()):
+                issues.append({
+                    "file": str(json_file),
+                    "severity": "warning",
+                    "error": (
+                        f"{ref_type} '{ref_name}' is not among the generated artifacts "
+                        f"({folder}/); it must already exist in the factory"
+                    ),
+                })
+    return issues

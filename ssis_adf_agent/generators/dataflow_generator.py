@@ -32,6 +32,15 @@ _DEST_TYPES = frozenset({
 })
 
 
+def _walk_tasks(tasks: list[Any]):
+    """Yield tasks recursively, descending into containers (Sequence/ForEach/For)."""
+    for t in tasks:
+        yield t
+        children = getattr(t, "tasks", None)
+        if children:
+            yield from _walk_tasks(children)
+
+
 def generate_data_flows(
     package: SSISPackage,
     output_dir: Path,
@@ -47,7 +56,7 @@ def generate_data_flows(
 
     results: list[dict[str, Any]] = []
 
-    for task in package.tasks:
+    for task in _walk_tasks(package.tasks):
         if task.task_type != TaskType.DATA_FLOW:
             continue
         assert isinstance(task, DataFlowTask)

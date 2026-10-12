@@ -110,7 +110,11 @@ def generate_pipeline(
 
     Returns the pipeline dict.
     """
-    dispatcher = ConverterDispatcher(stubs_dir=stubs_dir or output_dir / "stubs", llm_translate=llm_translate)
+    dispatcher = ConverterDispatcher(
+        stubs_dir=stubs_dir or output_dir / "stubs",
+        llm_translate=llm_translate,
+        connection_managers=package.connection_managers,
+    )
     pipeline_name = f"{pipeline_prefix}{package.name.replace(' ', '_')}"
 
     # Topological task ordering
@@ -136,6 +140,9 @@ def generate_pipeline(
                             script["text"] = apply_schema_remap(script["text"], schema_remap) or script["text"]
 
         activities.extend(acts)
+
+    # Flattened Sequence containers: point dependencies at their exit activities
+    dispatcher.rewire_container_dependencies(activities)
 
     # Build parameters from SSIS package parameters
     parameters: dict[str, Any] = {}

@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<DTS:Executable xmlns:DTS="www.microsoft.com/SqlServer/Dts" DTS:refId="Package" DTS:ExecutableType="Microsoft.Package" DTS:ObjectName="CargaVentas" DTS:DTSID="{11111111-1111-1111-1111-111111111111}">
+  <DTS:ConnectionManagers>
+    <DTS:ConnectionManager DTS:refId="Package.ConnectionManagers[SRC_OLTP]" DTS:CreationName="OLEDB" DTS:ObjectName="SRC_OLTP" DTS:DTSID="{22222222-2222-2222-2222-222222222222}">
+      <DTS:ObjectData><DTS:ConnectionManager DTS:ConnectionString="Data Source=srvoltp;Initial Catalog=Ventas;Provider=SQLNCLI11.1;Integrated Security=SSPI;"/></DTS:ObjectData>
+    </DTS:ConnectionManager>
+    <DTS:ConnectionManager DTS:refId="Package.ConnectionManagers[DW]" DTS:CreationName="OLEDB" DTS:ObjectName="DW" DTS:DTSID="{33333333-3333-3333-3333-333333333333}">
+      <DTS:ObjectData><DTS:ConnectionManager DTS:ConnectionString="Data Source=srvdw;Initial Catalog=DW;Provider=SQLNCLI11.1;Integrated Security=SSPI;"/></DTS:ObjectData>
+    </DTS:ConnectionManager>
+  </DTS:ConnectionManagers>
+  <DTS:Executables>
+    <DTS:Executable DTS:refId="Package\Truncar Stage" DTS:ExecutableType="Microsoft.ExecuteSQLTask" DTS:ObjectName="Truncar Stage" DTS:DTSID="{44444444-4444-4444-4444-444444444444}">
+      <DTS:ObjectData><SQLTask:SqlTaskData xmlns:SQLTask="www.microsoft.com/sqlserver/dts/tasks/sqltask" SQLTask:Connection="{33333333-3333-3333-3333-333333333333}" SQLTask:SqlStatementSource="TRUNCATE TABLE stg.Ventas"/></DTS:ObjectData>
+    </DTS:Executable>
+    <DTS:Executable DTS:refId="Package\Cargar Ventas" DTS:ExecutableType="Microsoft.Pipeline" DTS:ObjectName="Cargar Ventas" DTS:DTSID="{55555555-5555-5555-5555-555555555555}">
+      <DTS:ObjectData><pipeline version="1"><components>
+        <component refId="Package\Cargar Ventas\Origen" componentClassID="Microsoft.OLEDBSource" name="Origen">
+          <properties><property name="SqlCommand">SELECT * FROM dbo.Ventas</property><property name="AccessMode">2</property></properties>
+          <connections><connection refId="x" connectionManagerID="Package.ConnectionManagers[SRC_OLTP]" connectionManagerRefId="Package.ConnectionManagers[SRC_OLTP]" name="OleDbConnection"/></connections>
+        </component>
+        <component refId="Package\Cargar Ventas\Destino" componentClassID="Microsoft.OLEDBDestination" name="Destino">
+          <properties><property name="OpenRowset">[stg].[Ventas]</property><property name="AccessMode">3</property></properties>
+          <connections><connection refId="y" connectionManagerID="Package.ConnectionManagers[DW]" connectionManagerRefId="Package.ConnectionManagers[DW]" name="OleDbConnection"/></connections>
+        </component>
+      </components><paths><path refId="p" startId="Package\Cargar Ventas\Origen.Outputs[Salida]" endId="Package\Cargar Ventas\Destino.Inputs[Entrada]" name="p"/></paths></pipeline></DTS:ObjectData>
+    </DTS:Executable>
+  </DTS:Executables>
+  <DTS:PrecedenceConstraints>
+    <DTS:PrecedenceConstraint DTS:refId="Package.PrecedenceConstraints[c1]" DTS:From="Package\Truncar Stage" DTS:To="Package\Cargar Ventas" DTS:ObjectName="c1"/>
+  </DTS:PrecedenceConstraints>
+</DTS:Executable>

@@ -467,6 +467,7 @@ async def _convert(args: dict[str, Any]) -> list[types.TextContent]:
         for act in pipeline.get("properties", {}).get("activities", [])
         if "MANUAL REVIEW" in act.get("description", "") or "UNSUPPORTED" in act.get("description", "")
     ]
+    conversion_warnings.extend(_data_flow_warnings(data_flows, package))
 
     summary = {
         "package_name": package.name,
@@ -493,6 +494,37 @@ async def _convert(args: dict[str, Any]) -> list[types.TextContent]:
     }
 
     return [types.TextContent(type="text", text=json.dumps(summary, indent=2))]
+
+
+def _data_flow_warnings(data_flows: list[dict[str, Any]], package: Any) -> list[str]:
+    """Warnings for generated Mapping Data Flows (they are skeletons, and ADF
+    Mapping Data Flows cannot reach on-premises SQL Server through a
+    Self-Hosted Integration Runtime)."""
+    from .converters.sql_flavor import is_azure_sql
+
+    cms = {f"LS_{cm.id}": cm for cm in package.connection_managers}
+    warnings: list[str] = []
+    for df in data_flows:
+        name = df.get("name", "?")
+        warnings.append(
+            f"[MANUAL REVIEW] Mapping Data Flow '{name}' is a skeleton: complete the output "
+            "schemas, expressions and lookup/join conditions in its script before deploying."
+        )
+        tp = df.get("properties", {}).get("typeProperties", {})
+        on_prem = sorted({
+            cms[ls].name
+            for item in tp.get("sources", []) + tp.get("sinks", [])
+            for ls in [item.get("linkedService", {}).get("referenceName", "")]
+            if ls in cms and not is_azure_sql(cms[ls])
+        })
+        if on_prem:
+            warnings.append(
+                f"[MANUAL REVIEW] Mapping Data Flow '{name}' uses on-premises connection(s) "
+                f"{on_prem}. Mapping Data Flows do not run on a Self-Hosted IR: stage the data "
+                "to Azure first with a Copy activity, or use a Managed VNet IR with private "
+                "endpoints."
+            )
+    return warnings
 
 
 async def _validate(args: dict[str, Any]) -> list[types.TextContent]:

@@ -16,8 +16,26 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from ...parsers.models import ExecuteSQLTask, PrecedenceConstraint, SSISTask
+from ...parsers.models import ExecuteSQLTask, PrecedenceConstraint, SSISConnectionManager, SSISTask
 from ..base_converter import BaseConverter
+from ..sql_flavor import flavor_for
+
+# The .dtsx stores SQLTask:ResultType as e.g. "ResultSetType_SingleRow".
+_RESULT_TYPE_ALIASES = {
+    "resultsettype_none": "None",
+    "resultsettype_singlerow": "SingleRow",
+    "resultsettype_rowset": "FullResultSet",
+    "resultsettype_xml": "Xml",
+    "none": "None",
+    "singlerow": "SingleRow",
+    "fullresultset": "FullResultSet",
+    "rowset": "FullResultSet",
+    "xml": "Xml",
+}
+
+
+def normalize_result_type(raw: str | None) -> str:
+    return _RESULT_TYPE_ALIASES.get((raw or "None").strip().lower(), "None")
 
 _PROC_PATTERN = re.compile(
     r"^\s*(exec(?:ute)?\s+|call\s+)(?:\[?[\w\s]+\]?\.)?\[?[\w\s]+\]?",
@@ -68,6 +86,11 @@ def apply_schema_remap(sql: str | None, schema_remap: dict[str, str] | None) -> 
 
 
 class ExecuteSQLConverter(BaseConverter):
+    def __init__(
+        self, connections_by_id: dict[str, SSISConnectionManager] | None = None
+    ) -> None:
+        self._connections_by_id = connections_by_id or {}
+
     def convert(
         self,
         task: SSISTask,
@@ -77,7 +100,7 @@ class ExecuteSQLConverter(BaseConverter):
         assert isinstance(task, ExecuteSQLTask)
         depends_on = self._depends_on(task, constraints, task_by_id)
 
-        result_type = task.result_set_type or "None"
+        result_type = normalize_result_type(task.result_set_type)
 
         # Build linked service reference from connection_id placeholder
         linked_service_ref = {
@@ -99,7 +122,8 @@ class ExecuteSQLConverter(BaseConverter):
         ls_ref: dict,
         depends_on: list,
     ) -> dict[str, Any]:
-        first_row_only = task.result_set_type == "SingleRow"
+        first_row_only = normalize_result_type(task.result_set_type) == "SingleRow"
+        flavor = flavor_for(task.connection_id, self._connections_by_id)
         return {
             "name": task.name,
             "description": task.description or "",
@@ -113,7 +137,7 @@ class ExecuteSQLConverter(BaseConverter):
             },
             "typeProperties": {
                 "source": {
-                    "type": "AzureSqlSource",
+                    "type": flavor.source_type,
                     "sqlReaderQuery": task.sql_statement or "",
                     "queryTimeout": "02:00:00",
                 },
