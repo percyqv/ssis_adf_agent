@@ -3,7 +3,7 @@ SSIS → ADF MCP Server.
 
 Exposes five tools to GitHub Copilot (and any MCP-compatible client):
 
-1. scan_ssis_packages      — discover .dtsx files (local / git / sql server)
+1. scan_ssis_packages      — discover .dtsx files (Azure Blob / local / git / sql server)
 2. analyze_ssis_package    — complexity + gap analysis of a single package
 3. convert_ssis_package    — full conversion of a package to ADF JSON artifacts
 4. validate_adf_artifacts  — structural validation of generated artifacts
@@ -16,11 +16,23 @@ Run as an MCP stdio server::
 Or via the installed script::
 
     ssis-adf-agent
+
+Remote clients (Copilot Studio, Claude, …) over Streamable HTTP::
+
+    ssis-adf-agent --transport http --host 0.0.0.0 --port 8000
+
+Every path argument also accepts Azure Blob Storage locations (az://container/path).
+See README "Running as a remote MCP server" for configuration.
 """
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import shutil
+import tempfile
 import traceback
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +45,31 @@ from mcp.server import Server
 # ---------------------------------------------------------------------------
 
 server = Server("ssis-adf-agent")
+
+_PATH_HELP = (
+    "Accepts a local path, an Azure Blob Storage location 'az://<container>/<path>' "
+    "(storage account from AZURE_STORAGE_ACCOUNT / AZURE_STORAGE_ACCOUNT_URL), or a full "
+    "'https://<account>.blob.core.windows.net/<container>/<path>' URL."
+)
+
+# Runtime policy. Remote (HTTP) deployments restrict local filesystem access
+# and, unless explicitly enabled, deployment to Azure Data Factory.
+_POLICY: dict[str, bool] = {"allow_local_paths": True, "allow_deploy": True}
+
+
+def configure_policy(*, allow_local_paths: bool, allow_deploy: bool) -> None:
+    _POLICY["allow_local_paths"] = allow_local_paths
+    _POLICY["allow_deploy"] = allow_deploy
+
+
+def _check_path(value: str | None, arg_name: str) -> None:
+    from .storage import is_blob_uri
+
+    if value and not _POLICY["allow_local_paths"] and not is_blob_uri(value):
+        raise PermissionError(
+            f"'{arg_name}' must be an Azure Blob Storage location (az://<container>/<path>); "
+            "local filesystem paths are disabled on this server."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -47,19 +84,20 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "Discover all SSIS packages (.dtsx files) from a given source. "
                 "Returns a JSON list of found packages with name, path, and basic metadata. "
-                "source_type must be one of: 'local', 'git', 'sql'."
+                "source_type must be one of: 'blob' (Azure Blob Storage), 'local', 'git', 'sql'."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "source_type": {
                         "type": "string",
-                        "enum": ["local", "git", "sql"],
+                        "enum": ["blob", "local", "git", "sql"],
                         "description": "Where to find .dtsx files.",
                     },
                     "path_or_connection": {
                         "type": "string",
                         "description": (
+                            "For 'blob': container/folder, e.g. 'az://ssis-packages/Finanzas'. "
                             "For 'local': absolute filesystem directory path. "
                             "For 'git': repository URL or local path. "
                             "For 'sql': SQL Server connection string or 'SERVER=...;DATABASE=msdb'."
@@ -67,7 +105,7 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "recursive": {
                         "type": "boolean",
-                        "description": "Search subdirectories (local/git only). Default: true.",
+                        "description": "Search subdirectories (blob/local/git). Default: true.",
                         "default": True,
                     },
                     "git_branch": {
@@ -93,7 +131,7 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "package_path": {
                         "type": "string",
-                        "description": "Absolute path to the .dtsx file.",
+                        "description": "The .dtsx file. " + _PATH_HELP,
                     },
                     "esi_tables_path": {
                         "type": "string",
@@ -121,14 +159,15 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "package_path": {
                         "type": "string",
-                        "description": "Absolute path to the .dtsx file to convert.",
+                        "description": "The .dtsx file to convert. " + _PATH_HELP,
                     },
                     "output_dir": {
                         "type": "string",
                         "description": (
-                            "Directory to write ADF artifacts to. "
+                            "Where to write ADF artifacts (a folder, or a blob prefix such as "
+                            "'az://adf-artifacts/Finanzas/CargaVentas'). "
                             "Sub-folders pipeline/, linkedService/, dataset/, dataflow/, trigger/, stubs/ "
-                            "will be created automatically."
+                            "will be created automatically. " + _PATH_HELP
                         ),
                     },
                     "generate_trigger": {
@@ -213,7 +252,7 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "artifacts_dir": {
                         "type": "string",
-                        "description": "Directory containing the generated ADF JSON artifacts.",
+                        "description": "Folder or blob prefix containing the generated ADF JSON artifacts. " + _PATH_HELP,
                     },
                 },
                 "required": ["artifacts_dir"],
@@ -222,7 +261,7 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="deploy_to_adf",
             description=(
-                "Deploy ADF JSON artifacts from a local directory to an Azure Data Factory instance. "
+                "Deploy ADF JSON artifacts (from a folder or a blob prefix) to an Azure Data Factory instance. "
                 "Deploys in correct dependency order: linked services → datasets → data flows → pipelines → triggers. "
                 "Triggers are deployed in Stopped state and must be activated manually. "
                 "Uses DefaultAzureCredential (az login, managed identity, or service principal env vars)."
@@ -232,7 +271,7 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "artifacts_dir": {
                         "type": "string",
-                        "description": "Directory containing generated ADF JSON artifacts.",
+                        "description": "Folder or blob prefix containing generated ADF JSON artifacts. " + _PATH_HELP,
                     },
                     "subscription_id": {
                         "type": "string",
@@ -290,7 +329,17 @@ async def _scan(args: dict[str, Any]) -> list[types.TextContent]:
 
     packages_info: list[dict[str, Any]] = []
 
-    if source_type == "local":
+    if source_type == "local" and not _POLICY["allow_local_paths"]:
+        raise PermissionError("source_type 'local' is disabled on this server; use 'blob'.")
+
+    if source_type == "blob":
+        from .storage import list_blobs
+
+        for uri in list_blobs(path_or_conn, suffix=".dtsx", recursive=recursive):
+            name = uri.rstrip("/").rsplit("/", 1)[-1]
+            packages_info.append({"name": name[: -len(".dtsx")], "path": uri, "source": "blob"})
+
+    elif source_type == "local":
         from .parsers.readers.local_reader import LocalReader
         reader = LocalReader()
         paths = reader.scan(path_or_conn, recursive=recursive)
@@ -311,10 +360,11 @@ async def _scan(args: dict[str, Any]) -> list[types.TextContent]:
             })
 
     elif source_type == "sql":
-        from .parsers.readers.sql_reader import SqlServerReader
         # Expect path_or_conn to be a pyodbc-style connection string
         # Parse it first to get server/database
         import re
+
+        from .parsers.readers.sql_reader import SqlServerReader
         server_m = re.search(r"SERVER=([^;]+)", path_or_conn, re.I)
         db_m = re.search(r"DATABASE=([^;]+)", path_or_conn, re.I)
         server = server_m.group(1) if server_m else "localhost"
@@ -333,15 +383,27 @@ async def _scan(args: dict[str, Any]) -> list[types.TextContent]:
 
 async def _analyze(args: dict[str, Any]) -> list[types.TextContent]:
     from .parsers.readers.local_reader import LocalReader
-    from .analyzers.complexity_scorer import score_package
-    from .analyzers.gap_analyzer import analyze_gaps
-    from .analyzers.dependency_graph import build_package_dependency_order
-    from .analyzers.cdm_pattern_detector import detect_cdm_patterns
-    from .analyzers.esi_reuse_analyzer import analyze_esi_reuse, load_esi_config
+    from .storage import local_input_file
 
-    path = Path(args["package_path"])
-    reader = LocalReader()
-    package = reader.read(path)
+    _check_path(args["package_path"], "package_path")
+    _check_path(args.get("esi_tables_path"), "esi_tables_path")
+    with contextlib.ExitStack() as stack:
+        path = stack.enter_context(local_input_file(args["package_path"]))
+        package = LocalReader().read(path)
+        package.source_file = args["package_path"]
+        esi_local = (
+            str(stack.enter_context(local_input_file(args["esi_tables_path"])))
+            if args.get("esi_tables_path") else None
+        )
+        return _analyze_package(package, esi_local)
+
+
+def _analyze_package(package: Any, esi_tables_path: str | None) -> list[types.TextContent]:
+    from .analyzers.cdm_pattern_detector import detect_cdm_patterns
+    from .analyzers.complexity_scorer import score_package
+    from .analyzers.dependency_graph import build_package_dependency_order
+    from .analyzers.esi_reuse_analyzer import analyze_esi_reuse, load_esi_config
+    from .analyzers.gap_analyzer import analyze_gaps
 
     complexity = score_package(package)
     gaps = analyze_gaps(package)
@@ -352,7 +414,6 @@ async def _analyze(args: dict[str, Any]) -> list[types.TextContent]:
 
     # ESI reuse detection
     esi_gaps: list = []
-    esi_tables_path = args.get("esi_tables_path")
     if esi_tables_path:
         esi_config = load_esi_config(esi_tables_path)
         esi_gaps = analyze_esi_reuse(package, esi_config)
@@ -387,15 +448,71 @@ async def _analyze(args: dict[str, Any]) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=json.dumps(report, indent=2))]
 
 
+@contextlib.contextmanager
+def _optional_input_dir(path: str) -> Iterator[Path]:
+    """Like storage.local_input_dir, but an empty/missing blob prefix yields an empty dir."""
+    from .storage import is_blob_uri, local_input_dir
+
+    if not is_blob_uri(path):
+        yield Path(path)
+        return
+    try:
+        with local_input_dir(path) as local:
+            yield local
+    except FileNotFoundError:
+        tmp = Path(tempfile.mkdtemp(prefix="ssis_adf_in_"))
+        try:
+            yield tmp
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def _convert(args: dict[str, Any]) -> list[types.TextContent]:
-    from .parsers.readers.local_reader import LocalReader
-    from .generators.pipeline_generator import generate_pipeline
-    from .generators.linked_service_generator import generate_linked_services
-    from .generators.dataset_generator import generate_datasets
-    from .generators.dataflow_generator import generate_data_flows
-    from .generators.trigger_generator import generate_triggers
+    from .storage import OutputDir, local_input_file
+
+    for key in ("package_path", "output_dir", "schema_remap_path", "esi_tables_path",
+                "shared_artifacts_dir"):
+        _check_path(args.get(key), key)
+
+    out = OutputDir(args["output_dir"])
+    try:
+        with contextlib.ExitStack() as stack:
+            local_args = dict(args)
+            local_args["package_path"] = str(
+                stack.enter_context(local_input_file(args["package_path"]))
+            )
+            for key in ("schema_remap_path", "esi_tables_path"):
+                if args.get(key):
+                    local_args[key] = str(stack.enter_context(local_input_file(args[key])))
+            if args.get("shared_artifacts_dir"):
+                local_args["shared_artifacts_dir"] = str(
+                    stack.enter_context(_optional_input_dir(args["shared_artifacts_dir"]))
+                )
+            local_args["output_dir"] = str(out.local)
+            summary = _convert_local(local_args, source_label=args["package_path"])
+            out.finish()
+
+        if out.is_blob:
+            summary["output_directory"] = out.target
+            files = summary["files"]
+            files["pipeline"] = out.display(files["pipeline"])
+            files["stubs"] = [out.display(f) for f in files["stubs"]]
+            summary["uploaded_blobs"] = len(out.uploaded)
+    finally:
+        out.cleanup()
+
+    return [types.TextContent(type="text", text=json.dumps(summary, indent=2))]
+
+
+def _convert_local(args: dict[str, Any], source_label: str) -> dict[str, Any]:
     from .analyzers.cdm_pattern_detector import detect_cdm_patterns
     from .analyzers.esi_reuse_analyzer import analyze_esi_reuse, load_esi_config
+    from .generators.dataflow_generator import generate_data_flows
+    from .generators.dataset_generator import generate_datasets
+    from .generators.linked_service_generator import generate_linked_services
+    from .generators.pipeline_generator import generate_pipeline
+    from .generators.trigger_generator import generate_triggers
+    from .parsers.readers.local_reader import LocalReader
 
     path = Path(args["package_path"])
     output_dir = Path(args["output_dir"])
@@ -424,6 +541,7 @@ async def _convert(args: dict[str, Any]) -> list[types.TextContent]:
 
     reader = LocalReader()
     package = reader.read(path)
+    package.source_file = source_label
 
     stubs_dir = output_dir / "stubs"
 
@@ -492,8 +610,7 @@ async def _convert(args: dict[str, Any]) -> list[types.TextContent]:
             "stubs": [str(f) for f in stub_files],
         },
     }
-
-    return [types.TextContent(type="text", text=json.dumps(summary, indent=2))]
+    return summary
 
 
 def _data_flow_warnings(data_flows: list[dict[str, Any]], package: Any) -> list[str]:
@@ -529,32 +646,60 @@ def _data_flow_warnings(data_flows: list[dict[str, Any]], package: Any) -> list[
 
 async def _validate(args: dict[str, Any]) -> list[types.TextContent]:
     from .deployer.adf_deployer import AdfDeployer
+    from .storage import local_input_dir
 
-    artifacts_dir = Path(args["artifacts_dir"])
-    # Validation doesn't require Azure credentials
-    deployer = AdfDeployer.__new__(AdfDeployer)
-    issues = deployer.validate_artifacts(artifacts_dir)
+    _check_path(args["artifacts_dir"], "artifacts_dir")
+    with local_input_dir(args["artifacts_dir"]) as artifacts_dir:
+        # Validation doesn't require Azure credentials
+        deployer = AdfDeployer.__new__(AdfDeployer)
+        issues = deployer.validate_artifacts(artifacts_dir)
+        local_root = str(artifacts_dir)
+        for issue in issues:
+            f = issue.get("file", "")
+            if f.startswith(local_root) and local_root != args["artifacts_dir"]:
+                rel = Path(f).relative_to(local_root).as_posix()
+                issue["file"] = f"{args['artifacts_dir'].rstrip('/')}/{rel}"
 
+    errors = [i for i in issues if i.get("severity", "error") == "error"]
+    warnings = [i for i in issues if i.get("severity") == "warning"]
     if not issues:
         result = {"status": "valid", "message": "All artifacts passed structural validation."}
+    elif not errors:
+        result = {
+            "status": "valid_with_warnings",
+            "warning_count": len(warnings),
+            "issues": warnings,
+        }
     else:
-        result = {"status": "issues_found", "issue_count": len(issues), "issues": issues}
+        result = {
+            "status": "issues_found",
+            "issue_count": len(issues),
+            "error_count": len(errors),
+            "issues": issues,
+        }
 
     return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
 
 
 async def _deploy(args: dict[str, Any]) -> list[types.TextContent]:
     from .deployer.adf_deployer import AdfDeployer
+    from .storage import local_input_dir
 
+    if not _POLICY["allow_deploy"]:
+        raise PermissionError(
+            "deploy_to_adf is disabled on this server (set SSIS_ADF_ALLOW_DEPLOY=true to enable)."
+        )
+    _check_path(args["artifacts_dir"], "artifacts_dir")
     deployer = AdfDeployer(
         subscription_id=args["subscription_id"],
         resource_group=args["resource_group"],
         factory_name=args["factory_name"],
     )
-    results = deployer.deploy_all(
-        Path(args["artifacts_dir"]),
-        dry_run=args.get("dry_run", False),
-    )
+    with local_input_dir(args["artifacts_dir"]) as artifacts_dir:
+        results = deployer.deploy_all(
+            artifacts_dir,
+            dry_run=args.get("dry_run", False),
+        )
 
     summary = {
         "total": len(results),
@@ -573,18 +718,86 @@ async def _deploy(args: dict[str, Any]) -> list[types.TextContent]:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run the server over stdio (default, for local clients) or Streamable HTTP."""
+    import argparse
     import asyncio
+    import logging
+    import sys
 
-    async def _run() -> None:
-        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-            await server.run(
-                read_stream,
-                write_stream,
-                server.create_initialization_options(),
-            )
+    parser = argparse.ArgumentParser(prog="ssis-adf-agent", description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--transport", choices=["stdio", "http"],
+        default=os.environ.get("MCP_TRANSPORT", "stdio"),
+        help="stdio for local clients (VS Code, Claude Desktop); http for remote clients. "
+             "Env: MCP_TRANSPORT.",
+    )
+    parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"),
+                        help="HTTP bind address (use 0.0.0.0 in a container). Env: HOST.")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8000")),
+                        help="HTTP port. Env: PORT.")
+    parser.add_argument("--allow-anonymous", action="store_true",
+                        default=_env_flag("MCP_ALLOW_ANONYMOUS", False),
+                        help="Allow HTTP without authentication (local testing only). "
+                             "Env: MCP_ALLOW_ANONYMOUS.")
+    args = parser.parse_args(argv)
 
-    asyncio.run(_run())
+    if args.transport == "stdio":
+        async def _run() -> None:
+            async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+                await server.run(
+                    read_stream,
+                    write_stream,
+                    server.create_initialization_options(),
+                )
+
+        asyncio.run(_run())
+        return
+
+    # ---- HTTP -------------------------------------------------------------
+    import uvicorn
+
+    from .auth import AuthConfig
+    from .http_app import create_app
+
+    logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), stream=sys.stderr)
+    auth = AuthConfig.from_env()
+    try:
+        auth.validate()
+    except ValueError as exc:
+        parser.error(str(exc))
+    if not auth.enabled and not args.allow_anonymous:
+        parser.error(
+            "HTTP transport requires authentication: set MCP_API_KEYS and/or "
+            "ENTRA_TENANT_ID + ENTRA_AUDIENCE (or --allow-anonymous for local testing)."
+        )
+
+    # Remote clients must not read/write the container's filesystem or deploy
+    # to ADF unless explicitly allowed.
+    configure_policy(
+        allow_local_paths=_env_flag("SSIS_ADF_ALLOW_LOCAL_PATHS", False),
+        allow_deploy=_env_flag("SSIS_ADF_ALLOW_DEPLOY", False),
+    )
+    allowed_hosts = [
+        h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()
+    ]
+    app = create_app(server, auth, bind_host=args.host, allowed_hosts=allowed_hosts)
+    logging.getLogger(__name__).info(
+        "Serving MCP over HTTP on %s:%s/mcp (auth: %s, local paths: %s, deploy: %s)",
+        args.host, args.port,
+        "+".join(m for m, on in (("api-key", bool(auth.api_keys)),
+                                 ("entra", auth.entra_enabled)) if on) or "NONE",
+        _POLICY["allow_local_paths"], _POLICY["allow_deploy"],
+    )
+    uvicorn.run(app, host=args.host, port=args.port, proxy_headers=True,
+                forwarded_allow_ips="*", log_level=os.environ.get("LOG_LEVEL", "info").lower())
 
 
 if __name__ == "__main__":

@@ -64,6 +64,7 @@ SQL Agent jobs ───┤      │   Optional configs:    │
 - [SSIS Component Mapping Reference](#ssis-component-mapping-reference)
 - [Generated Artifact Structure](#generated-artifact-structure)
 - [Manual Steps After Conversion](#manual-steps-after-conversion)
+- [Running as a Remote MCP Server (Azure)](#running-as-a-remote-mcp-server-azure)
 - [Development](#development)
 - [License](#license)
 
@@ -165,7 +166,7 @@ The `samples/` directory is intended as a convenient drop zone for `.dtsx` files
 
 3. For output, create a directory alongside `samples/` (e.g. `adf_output/`) to keep generated artifacts separate from source packages.
 
-> The `samples/` directory is `.gitignore`-friendly — add your test packages there without worrying about committing proprietary SSIS files.
+> `samples/` contains two small hand-written packages used by the test suite. Put your own packages in `samples/local/`, which is ignored by Git, so proprietary SSIS files are never committed.
 
 ---
 
@@ -653,6 +654,36 @@ After running `convert_ssis_package`, review the following checklist before depl
 
 ---
 
+## Running as a Remote MCP Server (Azure)
+
+Besides stdio (local clients), the server speaks **Streamable HTTP**, so remote clients —
+a Copilot Studio agent published to Teams, Claude custom connectors, VS Code — can share one
+deployment.
+
+```bash
+export MCP_API_KEYS="<at-least-24-random-characters>"
+export AZURE_STORAGE_ACCOUNT="<storage-account-name>"   # uses az login / managed identity
+ssis-adf-agent --transport http --host 0.0.0.0 --port 8000   # MCP endpoint: /mcp
+```
+
+- **Azure Blob Storage paths.** Every path argument accepts `az://<container>/<path>` or
+  `https://<account>.blob.core.windows.net/<container>/<path>`; `scan_ssis_packages`
+  supports `source_type: "blob"`. Inputs are downloaded and outputs uploaded automatically.
+- **Authentication.** API keys (`MCP_API_KEYS`, sent as `Authorization: Bearer <key>` or
+  `X-API-Key: <key>`) and/or Microsoft Entra ID access tokens (`ENTRA_TENANT_ID`,
+  `ENTRA_AUDIENCE`, optional `ENTRA_REQUIRED_SCOPES`). With `MCP_PUBLIC_URL` set, OAuth
+  Protected Resource Metadata (RFC 9728) is published. The HTTP server refuses to start
+  without authentication unless `--allow-anonymous` is given.
+- **Safe defaults for remote use.** Over HTTP, local filesystem paths and `deploy_to_adf`
+  are disabled unless `SSIS_ADF_ALLOW_LOCAL_PATHS=true` / `SSIS_ADF_ALLOW_DEPLOY=true`.
+- **Container.** The `Dockerfile` runs the HTTP server on port 8000 with a `/healthz` probe;
+  the server is stateless and can scale out.
+
+Step-by-step deployment to Azure Container Apps (Storage Account, managed identity,
+Entra ID, Copilot Studio / Claude / VS Code setup): **[docs/DEPLOY_AZURE.md](docs/DEPLOY_AZURE.md)**.
+
+---
+
 ## Development
 
 Install development dependencies:
@@ -666,6 +697,9 @@ pip install -e ".[dev]"
 ```bash
 pytest
 ```
+
+Blob Storage tests run against [Azurite](https://learn.microsoft.com/azure/storage/common/storage-use-azurite)
+and are skipped unless `SSIS_ADF_TEST_BLOB_CONNECTION_STRING` is set (see `tests/test_remote.py`).
 
 **Lint:**
 
