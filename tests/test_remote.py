@@ -54,6 +54,39 @@ def test_parse_blob_uris() -> None:
     assert not is_blob_uri("https://example.com/pkg.dtsx")
 
 
+def test_adls_directory_entries_are_skipped(tmp_path, monkeypatch) -> None:
+    """ADLS Gen2 lists folders as zero-length blobs with hdi_isfolder=true."""
+    from types import SimpleNamespace
+
+    from ssis_adf_agent import storage
+
+    blobs = {
+        "Fin/Carga": (b"", {"hdi_isfolder": "true"}),
+        "Fin/Carga/pipeline": (b"", {"hdi_isfolder": "true"}),
+        "Fin/Carga/pipeline/PL.json": (b"{}", {}),
+        "Fin/Pkg.dtsx": (b"<x/>", {}),
+    }
+
+    class FakeContainer:
+        def list_blobs(self, name_starts_with=None, include=None):
+            assert include == ["metadata"]
+            for name, (_, md) in sorted(blobs.items()):
+                if name.startswith(name_starts_with or ""):
+                    yield SimpleNamespace(name=name, metadata=md)
+
+        def download_blob(self, name):
+            return SimpleNamespace(readall=lambda: blobs[name][0])
+
+    monkeypatch.setattr(storage, "_container_client", lambda loc: FakeContainer())
+    assert storage.list_blobs("az://c/Fin") == [
+        "az://c/Fin/Carga/pipeline/PL.json", "az://c/Fin/Pkg.dtsx"
+    ]
+    out = storage.download_prefix("az://c/Fin/Carga", tmp_path)
+    assert [p.relative_to(out).as_posix() for p in out.rglob("*") if p.is_file()] == [
+        "pipeline/PL.json"
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------

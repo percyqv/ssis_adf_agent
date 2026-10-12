@@ -127,13 +127,28 @@ def _container_client(loc: BlobLocation):
 # Operations
 # ---------------------------------------------------------------------------
 
+def _iter_files(container, prefix: str):
+    """Yield blobs under *prefix*, skipping directory entries.
+
+    Storage accounts with a hierarchical namespace (ADLS Gen2) list folders as
+    zero-length blobs with metadata ``hdi_isfolder=true``; they are not files.
+    """
+    for blob in container.list_blobs(name_starts_with=prefix or None, include=["metadata"]):
+        metadata = getattr(blob, "metadata", None) or {}
+        if str(metadata.get("hdi_isfolder", "")).lower() == "true":
+            continue
+        if blob.name.endswith("/"):
+            continue
+        yield blob
+
+
 def list_blobs(uri: str, suffix: str = "", recursive: bool = True) -> list[str]:
     """List blob locations under *uri* (a prefix), optionally filtered by suffix."""
     loc = parse_blob_uri(uri)
     container = _container_client(loc)
     prefix = f"{loc.path}/" if loc.path else ""
     results: list[str] = []
-    for blob in container.list_blobs(name_starts_with=prefix or None):
+    for blob in _iter_files(container, prefix):
         name: str = blob.name
         if suffix and not name.lower().endswith(suffix.lower()):
             continue
@@ -166,9 +181,9 @@ def download_prefix(uri: str, dest_dir: Path) -> Path:
     container = _container_client(loc)
     prefix = f"{loc.path}/" if loc.path else ""
     count = 0
-    for blob in container.list_blobs(name_starts_with=prefix or None):
+    for blob in _iter_files(container, prefix):
         rel = blob.name[len(prefix):]
-        if not rel or rel.endswith("/"):
+        if not rel:
             continue
         target = dest_dir.joinpath(*PurePosixPath(rel).parts)
         target.parent.mkdir(parents=True, exist_ok=True)
