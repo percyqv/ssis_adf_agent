@@ -24,25 +24,28 @@
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
     [ValidatePattern('^[a-z0-9]{3,24}$')]
-    [string] $StorageAccount,                 # unico global: 3-24 minusculas/numeros
+    [string] $StorageAccount  = "stsiss2adflab01",   # unico global: 3-24 minusculas/numeros
 
-    [Parameter(Mandatory = $true)]
     [ValidatePattern('^[a-zA-Z0-9]{5,50}$')]
-    [string] $Registry,                       # unico global: 5-50 letras/numeros
+    [string] $Registry        = "acrsiss2adflab01",  # unico global: 5-50 letras/numeros
 
-    [string] $ResourceGroup   = "rg-ssis-migracion",
-    [string] $Location        = "eastus2",
+    [string] $ResourceGroup   = "Siss2adfLab",
+    [string] $Location        = "eastus",
     [string] $Environment     = "cae-ssis-migracion",
     [string] $AppName         = "ssis-adf-agent",
     [string] $InputContainer  = "ssis-packages",
     [string] $OutputContainer = "adf-artifacts",
-    [string] $Subscription    = "",
+    [string] $Subscription    = "Inetum-Lab",
     [switch] $RotateApiKey
 )
 
 $ErrorActionPreference = "Stop"
+
+# La Azure CLI en Windows usa la codificacion de la consola (cp1252) y falla al
+# imprimir caracteres Unicode de los logs ("'charmap' codec can't encode").
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
 
 # Nota: dentro de estas funciones se usa ErrorActionPreference=Continue porque en
 # Windows PowerShell 5.1 cualquier texto de az en stderr (avisos) se convierte en un
@@ -72,6 +75,14 @@ function Test-Az {
     $ErrorActionPreference = "Continue"
     & az @args *> $null
     return ($LASTEXITCODE -eq 0)
+}
+
+function Get-AcrTags($registry, $repository) {
+    # Tags de un repositorio del registro; vacio si el repositorio aun no existe.
+    $ErrorActionPreference = "Continue"
+    $tags = & az acr repository show-tags -n $registry --repository $repository -o tsv 2>$null
+    if ($LASTEXITCODE -ne 0) { return @() }
+    return @($tags)
 }
 
 function Get-GitShortSha {
@@ -162,8 +173,17 @@ $sha = Get-GitShortSha
 if ($sha) { $tag = "$tag-$sha" }
 $image = "$registryServer/ssis-adf-agent:$tag"
 
-Write-Step "Construyendo la imagen en Azure: $image (unos minutos)"
-Invoke-AzLive acr build -r $Registry -g $ResourceGroup -t "ssis-adf-agent:$tag" -f Dockerfile .
+Write-Step "Construyendo la imagen en Azure: $image (5-10 minutos)"
+# --no-logs: espera a que termine sin transmitir el log en vivo (evita el fallo de
+# codificacion de la CLI en Windows). Se comprueba despues que la imagen exista.
+Invoke-AzLive acr build -r $Registry -g $ResourceGroup -t "ssis-adf-agent:$tag" `
+    -f Dockerfile --no-logs --query "{run:runId, estado:status}" -o table .
+if ((Get-AcrTags $Registry "ssis-adf-agent") -notcontains $tag) {
+    throw ("La imagen no se construyo. Revisa las ejecuciones con:`n" +
+           "  az acr task list-runs -r $Registry -o table`n" +
+           "  az acr task logs -r $Registry --run-id <RUN_ID>")
+}
+Write-Host "Imagen construida: $image"
 
 # ---------------------------------------------------------------------------
 Write-Step "Container Apps Environment $Environment"
