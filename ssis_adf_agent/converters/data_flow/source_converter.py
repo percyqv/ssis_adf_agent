@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any
 
 from ...parsers.models import DataFlowComponent
+from ...naming import linked_service_ref
 
 # Map SSIS source component type → ADF dataset type
 _SOURCE_DATASET_TYPE: dict[str, str] = {
@@ -24,7 +25,9 @@ _SOURCE_STORE_SETTINGS: dict[str, dict] = {
 }
 
 
-def convert_source(component: DataFlowComponent) -> dict[str, Any]:
+def convert_source(
+    component: DataFlowComponent, ls_names: dict[str, str] | None = None
+) -> dict[str, Any]:
     """
     Return an ADF Mapping Data Flow ``source`` transformation dict.
 
@@ -42,7 +45,7 @@ def convert_source(component: DataFlowComponent) -> dict[str, Any]:
             "type": "DatasetReference",
         },
         "linkedService": {
-            "referenceName": f"LS_{component.connection_id or 'unknown'}",
+            "referenceName": linked_service_ref(component.connection_id, ls_names),
             "type": "LinkedServiceReference",
         },
         "typeProperties": {

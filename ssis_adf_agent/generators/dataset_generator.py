@@ -12,6 +12,7 @@ from typing import Any
 
 from ..converters.control_flow.execute_sql_converter import normalize_result_type
 from ..converters.sql_flavor import flavor_for
+from ..naming import linked_service_names, linked_service_ref
 from ..parsers.models import (
     ConnectionManagerType,
     DataFlowComponent,
@@ -152,6 +153,7 @@ def generate_datasets(
                 existing_ds.add(f.stem)
 
     conn_by_id: dict[str, SSISConnectionManager] = {cm.id: cm for cm in package.connection_managers}
+    ls_names = linked_service_names(package.connection_managers)
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
 
@@ -173,7 +175,7 @@ def generate_datasets(
                     _write(_build_dataset(
                         name=ds_name,
                         ds_type=flavor_for(task.connection_id, conn_by_id).dataset_type,
-                        linked_service_name=f"LS_{task.connection_id or 'unknown'}",
+                        linked_service_name=linked_service_ref(task.connection_id, ls_names),
                         description=f"Dataset for SSIS Execute SQL Task (Lookup): {task.name}",
                     ))
             continue
@@ -196,7 +198,7 @@ def generate_datasets(
             seen.add(ds_name)
 
             conn = conn_by_id.get(comp.connection_id or "")
-            ls_name = f"LS_{comp.connection_id or 'unknown'}"
+            ls_name = linked_service_ref(comp.connection_id, ls_names)
             table = (
                 comp.properties.get("OpenRowset")
                 or comp.properties.get("TableOrViewName")

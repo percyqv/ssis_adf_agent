@@ -18,6 +18,7 @@ from typing import Any
 
 from ...parsers.models import ExecuteSQLTask, PrecedenceConstraint, SSISConnectionManager, SSISTask
 from ..base_converter import BaseConverter
+from ...naming import linked_service_ref as _ls_ref
 from ..sql_flavor import flavor_for
 
 # The .dtsx stores SQLTask:ResultType as e.g. "ResultSetType_SingleRow".
@@ -87,9 +88,12 @@ def apply_schema_remap(sql: str | None, schema_remap: dict[str, str] | None) -> 
 
 class ExecuteSQLConverter(BaseConverter):
     def __init__(
-        self, connections_by_id: dict[str, SSISConnectionManager] | None = None
+        self,
+        connections_by_id: dict[str, SSISConnectionManager] | None = None,
+        ls_names: dict[str, str] | None = None,
     ) -> None:
         self._connections_by_id = connections_by_id or {}
+        self._ls_names = ls_names or {}
 
     def convert(
         self,
@@ -104,7 +108,7 @@ class ExecuteSQLConverter(BaseConverter):
 
         # Build linked service reference from connection_id placeholder
         linked_service_ref = {
-            "referenceName": f"LS_{task.connection_id or 'unknown'}",
+            "referenceName": _ls_ref(task.connection_id, self._ls_names),
             "type": "LinkedServiceReference",
         }
 

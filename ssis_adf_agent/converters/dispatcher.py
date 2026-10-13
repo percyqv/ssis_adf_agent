@@ -33,7 +33,10 @@ class ConverterDispatcher:
         llm_translate: bool = False,
         connection_managers: list[SSISConnectionManager] | None = None,
     ) -> None:
+        from ..naming import linked_service_names
+
         connections_by_id = {cm.id: cm for cm in (connection_managers or [])}
+        ls_names = linked_service_names(connection_managers or [])
         script_converter = ScriptTaskConverter(stubs_output_dir=stubs_dir, llm_translate=llm_translate)
 
         # Pass self to loop converters so they can recursively convert inner tasks
@@ -41,7 +44,9 @@ class ConverterDispatcher:
         for_loop_converter = ForLoopConverter(child_converter=self)
 
         self._registry: dict[TaskType, BaseConverter] = {
-            TaskType.EXECUTE_SQL: ExecuteSQLConverter(connections_by_id=connections_by_id),
+            TaskType.EXECUTE_SQL: ExecuteSQLConverter(
+                connections_by_id=connections_by_id, ls_names=ls_names
+            ),
             TaskType.EXECUTE_PACKAGE: ExecutePackageConverter(),
             TaskType.FILE_SYSTEM: FileSystemConverter(),
             TaskType.FTP: _FTPConverter(),

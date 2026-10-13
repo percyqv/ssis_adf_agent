@@ -619,7 +619,10 @@ def _data_flow_warnings(data_flows: list[dict[str, Any]], package: Any) -> list[
     Self-Hosted Integration Runtime)."""
     from .converters.sql_flavor import is_azure_sql
 
-    cms = {f"LS_{cm.id}": cm for cm in package.connection_managers}
+    from .naming import linked_service_names
+
+    names = linked_service_names(package.connection_managers)
+    cms = {names[cm.id]: cm for cm in package.connection_managers}
     warnings: list[str] = []
     for df in data_flows:
         name = df.get("name", "?")

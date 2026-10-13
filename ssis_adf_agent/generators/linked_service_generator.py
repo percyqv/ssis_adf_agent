@@ -318,6 +318,9 @@ def generate_linked_services(
                 except Exception:
                     continue
 
+    from ..naming import linked_service_names
+
+    ls_names = linked_service_names(package.connection_managers)
     seen_ids: set[str] = set()
     results: list[dict[str, Any]] = []
     generated_kv = False
@@ -338,6 +341,7 @@ def generate_linked_services(
 
         builder = _BUILDERS.get(cm.type, _generic_ls)
         ls = builder(cm, ir_name, auth_type, use_key_vault, kv_ls_name)
+        ls["name"] = ls_names[cm.id]
 
         # Generate Key Vault linked service once if needed
         if use_key_vault and not generated_kv:

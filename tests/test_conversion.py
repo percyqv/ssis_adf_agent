@@ -164,3 +164,38 @@ def test_validate_detects_dangling_dependency(tmp_path: Path) -> None:
     result = _call("validate_adf_artifacts", {"artifacts_dir": str(tmp_path)})
     assert result["status"] == "issues_found"
     assert any("Does Not Exist" in i["error"] for i in result["issues"])
+
+
+# ---------------------------------------------------------------------------
+# Naming
+# ---------------------------------------------------------------------------
+
+def test_linked_services_are_named_after_connection_managers(tmp_path: Path) -> None:
+    summary, pipeline = _convert("CargaVentas.dtsx", tmp_path)
+    assert sorted(summary["files"]["linked_services"]) == ["LS_DW", "LS_SRC_OLTP"]
+    assert (tmp_path / "linkedService" / "LS_DW.json").exists()
+
+    script = _activities(pipeline)["Truncar Stage"]
+    assert script["linkedServiceName"]["referenceName"] == "LS_DW"
+    ds = json.loads((tmp_path / "dataset" / "DS_Origen.json").read_text("utf-8"))
+    assert ds["properties"]["linkedServiceName"]["referenceName"] == "LS_SRC_OLTP"
+
+    # No GUID-based names anywhere in the output
+    for f in tmp_path.rglob("*.json"):
+        assert "LS_2222" not in f.read_text("utf-8") and "LS_3333" not in f.read_text("utf-8")
+
+
+def test_linked_service_names_are_safe_and_unique() -> None:
+    from ssis_adf_agent.naming import linked_service_names, linked_service_ref
+    from ssis_adf_agent.parsers.models import ConnectionManagerType, SSISConnectionManager
+
+    cms = [
+        SSISConnectionManager(id="A", name="CRM Origen", type=ConnectionManagerType.OLEDB),
+        SSISConnectionManager(id="B", name="CRM.Origen", type=ConnectionManagerType.OLEDB),
+        SSISConnectionManager(id="C", name="crm_origen", type=ConnectionManagerType.OLEDB),
+    ]
+    names = linked_service_names(cms)
+    assert names == {"A": "LS_CRM_Origen", "B": "LS_CRM_Origen_2", "C": "LS_crm_origen_3"}
+    assert linked_service_ref("A", names) == "LS_CRM_Origen"
+    assert linked_service_ref("ProyectoCRM", names) == "LS_ProyectoCRM"  # project-level CM
+    assert linked_service_ref(None, names) == "LS_unknown"

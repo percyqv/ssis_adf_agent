@@ -2,11 +2,9 @@
   "servers": {
     "ssis-adf-agent": {
       "type": "stdio",
-      "command": "python",
+      "command": "C:\\Users\\PERCY.QUEVEDO\\Documents\\Desarrollo\\ssis_adf_agent\\.venv\\Scripts\\python.exe",
       "args": ["-m", "ssis_adf_agent.mcp_server"],
-      "cwd": "${workspaceFolder}",
-      "env": {},
-      "description": "SSIS → ADF conversion and deployment agent"
+      "cwd": "C:\\Users\\PERCY.QUEVEDO\\Documents\\Desarrollo\\ssis_adf_agent"
     }
   }
 }

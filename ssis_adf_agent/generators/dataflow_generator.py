@@ -20,6 +20,7 @@ from ..parsers.models import DataFlowTask, SSISPackage, TaskType
 from ..converters.data_flow.source_converter import convert_source
 from ..converters.data_flow.destination_converter import convert_destination
 from ..converters.data_flow.transformation_converter import convert_transformation
+from ..naming import linked_service_names
 
 _SOURCE_TYPES = frozenset({
     "OleDbSource", "FlatFileSource", "ExcelSource", "OdbcSource",
@@ -55,6 +56,7 @@ def generate_data_flows(
     df_dir.mkdir(parents=True, exist_ok=True)
 
     results: list[dict[str, Any]] = []
+    ls_names = linked_service_names(package.connection_managers)
 
     for task in _walk_tasks(package.tasks):
         if task.task_type != TaskType.DATA_FLOW:
@@ -75,8 +77,8 @@ def generate_data_flows(
 
         df_name = f"DF_{task.name.replace(' ', '_')}"
 
-        sources = [convert_source(c) for c in sources_comps]
-        sinks = [convert_destination(c) for c in dest_comps]
+        sources = [convert_source(c, ls_names) for c in sources_comps]
+        sinks = [convert_destination(c, ls_names) for c in dest_comps]
         transformations: list[dict[str, Any]] = []
         for comp in transform_comps:
             t = convert_transformation(comp)
