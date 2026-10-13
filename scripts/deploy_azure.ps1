@@ -1,0 +1,236 @@
+<#
+.SYNOPSIS
+    Despliega el MCP ssis-adf-agent en Azure Container Apps con un Storage Account.
+
+.DESCRIPTION
+    Crea (o reutiliza si ya existen) estos recursos:
+      - Grupo de recursos
+      - Storage Account con los contenedores de entrada y salida
+      - Azure Container Registry, y construye la imagen EN AZURE (no requiere Docker)
+      - Container Apps Environment y el Container App con identidad administrada
+      - Permiso "Storage Blob Data Contributor" de la app sobre el Storage
+
+    Se puede ejecutar varias veces: si la app ya existe, solo construye una imagen
+    nueva y la despliega (no cambia la API key salvo que uses -RotateApiKey).
+
+    Ejecutar desde la carpeta raiz del repositorio, con "az login" hecho.
+
+.EXAMPLE
+    .\scripts\deploy_azure.ps1 -StorageAccount stssismigracion01 -Registry acrssismigracion01
+
+.EXAMPLE
+    .\scripts\deploy_azure.ps1 -StorageAccount stssismig01 -Registry acrssismig01 `
+        -ResourceGroup rg-ssis -Location brazilsouth -Subscription "Mi suscripcion"
+#>
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[a-z0-9]{3,24}$')]
+    [string] $StorageAccount,                 # unico global: 3-24 minusculas/numeros
+
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[a-zA-Z0-9]{5,50}$')]
+    [string] $Registry,                       # unico global: 5-50 letras/numeros
+
+    [string] $ResourceGroup   = "rg-ssis-migracion",
+    [string] $Location        = "eastus2",
+    [string] $Environment     = "cae-ssis-migracion",
+    [string] $AppName         = "ssis-adf-agent",
+    [string] $InputContainer  = "ssis-packages",
+    [string] $OutputContainer = "adf-artifacts",
+    [string] $Subscription    = "",
+    [switch] $RotateApiKey
+)
+
+$ErrorActionPreference = "Stop"
+
+# Nota: dentro de estas funciones se usa ErrorActionPreference=Continue porque en
+# Windows PowerShell 5.1 cualquier texto de az en stderr (avisos) se convierte en un
+# error que detendria el script. El resultado real se comprueba con $LASTEXITCODE.
+
+function Invoke-Az {
+    # Ejecuta az y detiene el script si falla. Devuelve la salida estandar.
+    $ErrorActionPreference = "Continue"
+    $out = & az @args
+    if ($LASTEXITCODE -ne 0) {
+        throw "Fallo: az $($args -join ' ')"
+    }
+    return $out
+}
+
+function Invoke-AzLive {
+    # Igual que Invoke-Az pero mostrando la salida en pantalla mientras se ejecuta.
+    $ErrorActionPreference = "Continue"
+    & az @args | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "Fallo: az $($args -join ' ')"
+    }
+}
+
+function Test-Az {
+    # Devuelve $true si el comando az termina bien (para comprobar si algo existe).
+    $ErrorActionPreference = "Continue"
+    & az @args *> $null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Get-GitShortSha {
+    $ErrorActionPreference = "Continue"
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return $null }
+    $sha = & git rev-parse --short HEAD 2>$null
+    if ($LASTEXITCODE -eq 0) { return $sha }
+    return $null
+}
+
+function Write-Step($text) { Write-Host "`n==> $text" -ForegroundColor Cyan }
+
+function New-ApiKey {
+    # 32 bytes aleatorios en base64 "url-safe" sin '=' (evita problemas al pasarla a az)
+    $bytes = New-Object byte[] 32
+    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    return ([Convert]::ToBase64String($bytes)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+# ---------------------------------------------------------------------------
+Write-Step "Comprobando Azure CLI y sesion"
+if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+    throw "No se encuentra 'az'. Instala Azure CLI: winget install -e --id Microsoft.AzureCLI"
+}
+if (-not (Test-Path ".\Dockerfile")) {
+    throw "Ejecuta el script desde la carpeta raiz del repositorio (donde esta el Dockerfile)."
+}
+if (-not (Test-Az account show)) {
+    Write-Host "Iniciando sesion en Azure..."
+    Invoke-Az login | Out-Null
+}
+if ($Subscription) { Invoke-Az account set --subscription $Subscription | Out-Null }
+$sub = Invoke-Az account show --query "{name:name, id:id}" -o json | ConvertFrom-Json
+Write-Host "Suscripcion: $($sub.name) ($($sub.id))"
+
+# Instala la extension containerapp sin preguntar
+Invoke-Az config set extension.use_dynamic_install=yes_without_prompt --only-show-errors | Out-Null
+
+Write-Step "Registrando proveedores de recursos (solo la primera vez tarda)"
+foreach ($ns in "Microsoft.App", "Microsoft.OperationalInsights", "Microsoft.ContainerRegistry", "Microsoft.Storage") {
+    Invoke-Az provider register --namespace $ns --wait | Out-Null
+}
+
+# ---------------------------------------------------------------------------
+Write-Step "Grupo de recursos $ResourceGroup ($Location)"
+Invoke-Az group create -n $ResourceGroup -l $Location -o none
+
+# ---------------------------------------------------------------------------
+Write-Step "Storage Account $StorageAccount"
+if (-not (Test-Az storage account show -n $StorageAccount -g $ResourceGroup)) {
+    Invoke-Az storage account create -n $StorageAccount -g $ResourceGroup -l $Location `
+        --sku Standard_LRS --kind StorageV2 `
+        --allow-blob-public-access false --min-tls-version TLS1_2 -o none
+}
+$storageId = Invoke-Az storage account show -n $StorageAccount -g $ResourceGroup --query id -o tsv
+
+# Tu usuario necesita un rol de datos para crear contenedores y subir archivos
+$me = Invoke-Az ad signed-in-user show --query id -o tsv
+if (-not (Invoke-Az role assignment list --assignee $me --scope $storageId --role "Storage Blob Data Contributor" --query "[0].id" -o tsv)) {
+    Invoke-Az role assignment create --assignee-object-id $me --assignee-principal-type User `
+        --role "Storage Blob Data Contributor" --scope $storageId -o none
+    Write-Host "Rol asignado a tu usuario; esperando a que se propague..."
+}
+
+foreach ($c in $InputContainer, $OutputContainer) {
+    # La asignacion de rol tarda 1-2 minutos en aplicarse: reintentar
+    $ok = $false
+    for ($i = 1; $i -le 12 -and -not $ok; $i++) {
+        if (Test-Az storage container create --account-name $StorageAccount -n $c --auth-mode login -o none) {
+            $ok = $true
+        } else {
+            Start-Sleep -Seconds 15
+        }
+    }
+    if (-not $ok) { throw "No se pudo crear el contenedor '$c'. Revisa tus permisos sobre el Storage Account." }
+    Write-Host "Contenedor listo: $c"
+}
+
+# ---------------------------------------------------------------------------
+Write-Step "Container Registry $Registry"
+if (-not (Test-Az acr show -n $Registry -g $ResourceGroup)) {
+    Invoke-Az acr create -n $Registry -g $ResourceGroup -l $Location --sku Basic -o none
+}
+$registryServer = Invoke-Az acr show -n $Registry -g $ResourceGroup --query loginServer -o tsv
+
+$tag = (Get-Date -Format "yyyyMMdd-HHmmss")
+$sha = Get-GitShortSha
+if ($sha) { $tag = "$tag-$sha" }
+$image = "$registryServer/ssis-adf-agent:$tag"
+
+Write-Step "Construyendo la imagen en Azure: $image (unos minutos)"
+Invoke-AzLive acr build -r $Registry -g $ResourceGroup -t "ssis-adf-agent:$tag" -f Dockerfile .
+
+# ---------------------------------------------------------------------------
+Write-Step "Container Apps Environment $Environment"
+if (-not (Test-Az containerapp env show -n $Environment -g $ResourceGroup)) {
+    Invoke-Az containerapp env create -n $Environment -g $ResourceGroup -l $Location -o none
+}
+
+$apiKey = $null
+if (-not (Test-Az containerapp show -n $AppName -g $ResourceGroup)) {
+    Write-Step "Creando Container App $AppName"
+    $apiKey = New-ApiKey
+    Invoke-Az containerapp create -n $AppName -g $ResourceGroup --environment $Environment `
+        --image $image `
+        --registry-server $registryServer --registry-identity system `
+        --system-assigned `
+        --ingress external --target-port 8000 `
+        --cpu 0.5 --memory 1.0Gi `
+        --min-replicas 1 --max-replicas 3 `
+        --secrets "mcp-api-keys=$apiKey" `
+        --env-vars "MCP_API_KEYS=secretref:mcp-api-keys" "AZURE_STORAGE_ACCOUNT=$StorageAccount" `
+        -o none
+} else {
+    Write-Step "Actualizando Container App $AppName con la nueva imagen"
+    if ($RotateApiKey) {
+        $apiKey = New-ApiKey
+        Invoke-Az containerapp secret set -n $AppName -g $ResourceGroup --secrets "mcp-api-keys=$apiKey" -o none
+    }
+    Invoke-Az containerapp update -n $AppName -g $ResourceGroup --image $image -o none
+}
+
+# ---------------------------------------------------------------------------
+Write-Step "Permiso de la app sobre el Storage Account"
+$appPrincipal = Invoke-Az containerapp show -n $AppName -g $ResourceGroup --query identity.principalId -o tsv
+if (-not $appPrincipal) { throw "El Container App no tiene identidad administrada (system-assigned)." }
+if (-not (Invoke-Az role assignment list --assignee $appPrincipal --scope $storageId --role "Storage Blob Data Contributor" --query "[0].id" -o tsv)) {
+    Invoke-Az role assignment create --assignee-object-id $appPrincipal --assignee-principal-type ServicePrincipal `
+        --role "Storage Blob Data Contributor" --scope $storageId -o none
+}
+
+$fqdn = Invoke-Az containerapp show -n $AppName -g $ResourceGroup --query properties.configuration.ingress.fqdn -o tsv
+$publicUrl = "https://$fqdn"
+Invoke-Az containerapp update -n $AppName -g $ResourceGroup --set-env-vars "MCP_PUBLIC_URL=$publicUrl" -o none
+
+# ---------------------------------------------------------------------------
+Write-Step "Comprobando $publicUrl/healthz"
+$healthy = $false
+for ($i = 1; $i -le 20 -and -not $healthy; $i++) {
+    try {
+        $r = Invoke-RestMethod "$publicUrl/healthz" -TimeoutSec 10
+        if ($r.status -eq "ok") { $healthy = $true }
+    } catch { Start-Sleep -Seconds 15 }
+}
+
+Write-Host ""
+if ($healthy) {
+    Write-Host "Listo. El MCP responde." -ForegroundColor Green
+} else {
+    Write-Host "La app no respondio todavia. Revisa los logs con:" -ForegroundColor Yellow
+    Write-Host "  az containerapp logs show -n $AppName -g $ResourceGroup --follow"
+}
+Write-Host ""
+Write-Host "URL del MCP : $publicUrl/mcp"
+Write-Host "Entrada     : az://$InputContainer/<carpeta>/<paquete>.dtsx"
+Write-Host "Salida      : az://$OutputContainer/<carpeta>/<paquete>"
+if ($apiKey) {
+    Write-Host ""
+    Write-Host "API key (guardala ahora en un lugar seguro; no se vuelve a mostrar):" -ForegroundColor Yellow
+    Write-Host $apiKey
+    Write-Host "Los clientes la envian en la cabecera  X-API-Key: <key>  o  Authorization: Bearer <key>"
+}

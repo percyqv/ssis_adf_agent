@@ -17,6 +17,21 @@ VS Code            ─────────────┘          │  (Str
 Los comandos son para **PowerShell** con la [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli)
 instalada (`az login` hecho). También sirven en Azure Cloud Shell (PowerShell).
 
+## Opción rápida: script
+
+`scripts/deploy_azure.ps1` hace las secciones 2 a 4 de una vez (y se puede volver a
+ejecutar para desplegar una versión nueva). Desde la carpeta raíz del repositorio:
+
+```powershell
+.\scripts\deploy_azure.ps1 -StorageAccount stssismigracion01 -Registry acrssismigracion01 `
+    -ResourceGroup rg-ssis-migracion -Location eastus2
+```
+
+Al terminar muestra la URL del MCP y, la primera vez, la API key. Si PowerShell bloquea el
+script, ejecuta antes `Set-ExecutionPolicy -Scope Process Bypass`.
+
+Las secciones siguientes explican lo mismo paso a paso.
+
 ---
 
 ## 1. Variables
