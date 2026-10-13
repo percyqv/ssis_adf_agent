@@ -51,12 +51,18 @@ $env:PYTHONUTF8 = "1"
 # Windows PowerShell 5.1 cualquier texto de az en stderr (avisos) se convierte en un
 # error que detendria el script. El resultado real se comprueba con $LASTEXITCODE.
 
+function Format-AzArgs($azArgs) {
+    # Texto del comando para mensajes de error, ocultando secretos (API keys).
+    $text = ($azArgs -join ' ')
+    return ($text -replace '(mcp-api-keys=)\S+', '$1***')
+}
+
 function Invoke-Az {
     # Ejecuta az y detiene el script si falla. Devuelve la salida estandar.
     $ErrorActionPreference = "Continue"
     $out = & az @args
     if ($LASTEXITCODE -ne 0) {
-        throw "Fallo: az $($args -join ' ')"
+        throw "Fallo: az $(Format-AzArgs $args)"
     }
     return $out
 }
@@ -66,7 +72,7 @@ function Invoke-AzLive {
     $ErrorActionPreference = "Continue"
     & az @args | Out-Host
     if ($LASTEXITCODE -ne 0) {
-        throw "Fallo: az $($args -join ' ')"
+        throw "Fallo: az $(Format-AzArgs $args)"
     }
 }
 
@@ -188,8 +194,30 @@ Write-Host "Imagen construida: $image"
 # ---------------------------------------------------------------------------
 Write-Step "Container Apps Environment $Environment"
 if (-not (Test-Az containerapp env show -n $Environment -g $ResourceGroup)) {
+    Write-Host "Creando el entorno (la primera vez puede tardar 15-30 minutos)..."
     Invoke-Az containerapp env create -n $Environment -g $ResourceGroup -l $Location -o none
 }
+
+# Esperar a que el entorno quede aprovisionado antes de crear la app.
+$envState = ""
+for ($i = 1; $i -le 90; $i++) {   # hasta ~45 minutos
+    $envState = Invoke-Az containerapp env show -n $Environment -g $ResourceGroup `
+        --query properties.provisioningState -o tsv
+    if ($envState -eq "Succeeded" -or $envState -eq "Failed") { break }
+    if ($i -eq 1 -or $i % 4 -eq 0) { Write-Host "Estado del entorno: $envState (esperando...)" }
+    Start-Sleep -Seconds 30
+}
+if ($envState -ne "Succeeded") {
+    Write-Host ""
+    Write-Host "El entorno '$Environment' quedo en estado '$envState'." -ForegroundColor Red
+    Write-Host "Detalles:" -ForegroundColor Yellow
+    & az containerapp env show -n $Environment -g $ResourceGroup -o jsonc | Out-Host
+    throw ("El entorno no se aprovisiono. Revisa el error en el portal (Activity log del grupo " +
+           "$ResourceGroup, evento 'Create or Update Managed Environment'). Para reintentar, " +
+           "borralo y vuelve a ejecutar el script:`n" +
+           "  az containerapp env delete -n $Environment -g $ResourceGroup --yes")
+}
+Write-Host "Entorno listo."
 
 $apiKey = $null
 if (-not (Test-Az containerapp show -n $AppName -g $ResourceGroup)) {
