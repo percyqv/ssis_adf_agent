@@ -21,7 +21,7 @@ Lo usan: la web `percyqv/ssis-adf-web` (App Service) y GitHub Copilot en VS Code
 | `ssis-adf-agent` | `.vscode/mcp.json` del repo (stdio) | El código local de la laptop (`.venv`) |
 | `ssis-adf-agent-azure` | `mcp.json` **de usuario** (`%APPDATA%\Code\User\mcp.json`), HTTP + `X-API-Key` | El servidor desplegado en Container Apps |
 
-> **Rama:** todo el trabajo está en `feat/azure-blob-http` (todavía no fusionada en `main`).
+> **Rama:** `main` (stdio y HTTP en el mismo código).
 
 ## Herramientas MCP
 
