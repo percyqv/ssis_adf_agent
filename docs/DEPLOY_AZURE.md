@@ -195,7 +195,12 @@ Las rutas siempre van al Storage Account, por ejemplo:
 
 ### VS Code
 
-`.vscode/mcp.json`:
+Copilot (modo agente) **no admite** variables `${input:...}` en servidores MCP: el servidor sale
+como *Unsupported*. Por eso el servidor remoto se configura en el `mcp.json` **de usuario**
+(no en el del proyecto), con la clave escrita tal cual, para que no acabe en Git.
+
+Ábrelo con *Ctrl+Shift+P → MCP: Open User Configuration*
+(`%APPDATA%\Code\User\mcp.json` en Windows):
 
 ```json
 {
@@ -203,14 +208,15 @@ Las rutas siempre van al Storage Account, por ejemplo:
     "ssis-adf-agent-azure": {
       "type": "http",
       "url": "https://<fqdn>/mcp",
-      "headers": { "X-API-Key": "${input:ssisAdfApiKey}" }
+      "headers": { "X-API-Key": "<tu-api-key>" }
     }
-  },
-  "inputs": [
-    { "id": "ssisAdfApiKey", "type": "promptString", "description": "API key", "password": true }
-  ]
+  }
 }
 ```
+
+El `.vscode/mcp.json` del repo queda para el servidor **local** (`ssis-adf-agent`, stdio).
+Si aparece *Sign In* o un 401, la clave del archivo no coincide con el secreto
+`mcp-api-keys` del Container App.
 
 ### Claude
 

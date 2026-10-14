@@ -13,7 +13,13 @@ Servidor **MCP** que convierte paquetes **SSIS (.dtsx)** en artefactos de **Azur
 - **Autenticación**: API key (`X-API-Key` o `Authorization: Bearer`) y/o Microsoft Entra ID (JWT).
 - Despliegue en **Azure Container Apps** con `scripts/deploy_azure.ps1`.
 
-Lo usan: la web `percyqv/ssis-adf-web` (App Service) y GitHub Copilot en VS Code.
+Lo usan: la web `percyqv/ssis-adf-web` (App Service) y GitHub Copilot en VS Code, donde hay
+**dos entradas**:
+
+| Nombre en VS Code | Dónde está configurado | Qué ejecuta |
+|---|---|---|
+| `ssis-adf-agent` | `.vscode/mcp.json` del repo (stdio) | El código local de la laptop (`.venv`) |
+| `ssis-adf-agent-azure` | `mcp.json` **de usuario** (`%APPDATA%\Code\User\mcp.json`), HTTP + `X-API-Key` | El servidor desplegado en Container Apps |
 
 > **Rama:** todo el trabajo está en `feat/azure-blob-http` (todavía no fusionada en `main`).
 
