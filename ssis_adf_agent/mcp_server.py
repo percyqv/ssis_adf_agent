@@ -614,9 +614,9 @@ def _convert_local(args: dict[str, Any], source_label: str) -> dict[str, Any]:
 
 
 def _data_flow_warnings(data_flows: list[dict[str, Any]], package: Any) -> list[str]:
-    """Warnings for generated Mapping Data Flows (they are skeletons, and ADF
-    Mapping Data Flows cannot reach on-premises SQL Server through a
-    Self-Hosted Integration Runtime)."""
+    """Warnings for generated Mapping Data Flows (they are skeletons, ADF Mapping
+    Data Flows cannot reach on-premises SQL Server through a Self-Hosted
+    Integration Runtime, and some SSIS components need manual work)."""
     from .converters.sql_flavor import is_azure_sql
 
     from .naming import linked_service_names
@@ -644,6 +644,14 @@ def _data_flow_warnings(data_flows: list[dict[str, Any]], package: Any) -> list[
                 "to Azure first with a Copy activity, or use a Managed VNet IR with private "
                 "endpoints."
             )
+        # Components that could not be (fully) converted, one warning each, so they
+        # are listed by name in the conversion summary instead of being buried in
+        # the data flow JSON.
+        for t in tp.get("transformations", []):
+            desc = t.get("description", "")
+            if "MANUAL REVIEW" in desc or "UNSUPPORTED" in desc:
+                desc = desc.removeprefix("[MANUAL REVIEW] ")
+                warnings.append(f"[MANUAL REVIEW] Mapping Data Flow '{name}': {desc}")
     return warnings
 
 

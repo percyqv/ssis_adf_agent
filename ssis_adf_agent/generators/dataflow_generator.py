@@ -1,8 +1,9 @@
 """
 Mapping Data Flow generator — emits ADF dataflow.json for each complex Data Flow Task.
 
-Simple (single source → single destination, no transforms) data flows are handled
-as Copy Activities; this generator only fires for multi-component flows.
+Simple (exactly one source → one destination, nothing else) data flows are handled
+as Copy Activities; this generator fires for every other flow. The decision lives in
+converters/data_flow/classification.py and is shared with the control-flow converter.
 
 Best practices applied:
   - allowSchemaDrift: true, validateSchema: false (Microsoft default for flexibility)
@@ -16,21 +17,12 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..parsers.models import DataFlowTask, SSISPackage, TaskType
-from ..converters.data_flow.source_converter import convert_source
+from ..converters.data_flow.classification import needs_mapping_data_flow, split_components
 from ..converters.data_flow.destination_converter import convert_destination
+from ..converters.data_flow.source_converter import convert_source
 from ..converters.data_flow.transformation_converter import convert_transformation
 from ..naming import linked_service_names
-
-_SOURCE_TYPES = frozenset({
-    "OleDbSource", "FlatFileSource", "ExcelSource", "OdbcSource",
-    "ADONetSource", "SqlServerSource",
-})
-_DEST_TYPES = frozenset({
-    "OleDbDestination", "FlatFileDestination", "ExcelDestination",
-    "OdbcDestination", "ADONetDestination", "SqlServerDestination",
-    "RecordsetDestination",
-})
+from ..parsers.models import DataFlowTask, SSISPackage, TaskType
 
 
 def _walk_tasks(tasks: list[Any]):
@@ -63,17 +55,12 @@ def generate_data_flows(
             continue
         assert isinstance(task, DataFlowTask)
 
-        sources_comps = [c for c in task.components if c.component_type in _SOURCE_TYPES]
-        dest_comps = [c for c in task.components if c.component_type in _DEST_TYPES]
-        transform_comps = [
-            c for c in task.components
-            if c.component_type not in _SOURCE_TYPES
-            and c.component_type not in _DEST_TYPES
-        ]
+        # Same rule as the control-flow converter, so the ExecuteDataFlow activity
+        # always has a data flow to reference (and a Copy never gets an orphan one).
+        if not needs_mapping_data_flow(task):
+            continue  # handled as Copy Activity (or an empty-task placeholder)
 
-        # Only generate a Mapping Data Flow for tasks with transforms (or multiple sources/sinks)
-        if not transform_comps and len(sources_comps) <= 1 and len(dest_comps) <= 1:
-            continue  # handled as Copy Activity
+        sources_comps, transform_comps, dest_comps = split_components(task)
 
         df_name = f"DF_{task.name.replace(' ', '_')}"
 

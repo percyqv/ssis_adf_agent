@@ -39,6 +39,9 @@ _UNSUPPORTED_DF_COMPONENTS: frozenset[str] = frozenset({
     "SqlServerDestination",   # BCP — use Copy Activity instead
     "RecordsetDestination",   # in-memory RS — needs variable workaround
     "Cache",
+    "OleDbCommand",           # per-row SQL — no Mapping Data Flow equivalent
+    "SlowlyChangingDimension",  # rebuild as Lookup + Split + Alter Row + sink
+    "RowSampling",            # exact N random rows — no equivalent
 })
 
 # Data flow components that map but need a review note
@@ -47,7 +50,21 @@ _REVIEW_DF_COMPONENTS: dict[str, str] = {
     "Sort": "ADF Sort transformation is memory-bound; confirm data volume is acceptable",
     "MergeJoin": "Inputs must be sorted in ADF; add Sort transformations if needed",
     "Merge": "Inputs must be sorted in ADF Merge transformation",
+    "Pivot": "Mapped to ADF Pivot; set group-by, pivot key and pivoted columns",
+    "Unpivot": "Mapped to ADF Unpivot; set ungroup-by, unpivot key and unpivoted columns",
+    "CopyColumn": "Mapped to Derived Column copies; verify the source of each copy",
+    "PercentageSampling": (
+        "Mapped to a Filter with random(); sample size is approximate and the "
+        "'unselected rows' output is not produced"
+    ),
 }
+
+
+def _is_known_df_component(component_type: str) -> bool:
+    from ..converters.data_flow.classification import DEST_TYPES, SOURCE_TYPES
+    from ..converters.data_flow.transformation_converter import KNOWN_TRANSFORMATION_TYPES
+
+    return component_type in SOURCE_TYPES | DEST_TYPES | KNOWN_TRANSFORMATION_TYPES
 
 
 def _walk_tasks(tasks: list[SSISTask]):  # type: ignore[type-arg]
@@ -219,6 +236,18 @@ def _analyze_task(task: SSISTask) -> list[GapItem]:
                     severity="warning",
                     message=_REVIEW_DF_COMPONENTS[comp.component_type],
                     recommendation="Review the generated Mapping Data Flow transformation.",
+                ))
+            elif not _is_known_df_component(comp.component_type):
+                gaps.append(GapItem(
+                    task_id=comp.id,
+                    task_name=f"{task.name} / {comp.name}",
+                    task_type=f"DataFlow/{comp.component_type}",
+                    severity="manual_required",
+                    message=(
+                        f"Data Flow component type '{comp.component_type}' is not recognised; "
+                        "it is kept as an empty placeholder in the Mapping Data Flow."
+                    ),
+                    recommendation="Implement the component's logic by hand in the data flow.",
                 ))
 
     # Cross-database and linked server references (applies to any task)

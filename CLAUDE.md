@@ -39,12 +39,12 @@ salvo `SSIS_ADF_ALLOW_DEPLOY=true` / `SSIS_ADF_ALLOW_LOCAL_PATHS=true`.
 | `ssis_adf_agent/auth.py` | API keys + validación JWT de Entra ID |
 | `ssis_adf_agent/storage.py` | Lectura/escritura en Blob (`az://`), omite carpetas ADLS |
 | `ssis_adf_agent/parsers/ssis_parser.py` | Parser .dtsx (precedencias por `refId`, `PROGID_MAP`, `_CLSID_LOOKUP`) |
-| `ssis_adf_agent/converters/` | Conversores por tipo de tarea; `sql_flavor.py` (SqlServer vs AzureSql) |
+| `ssis_adf_agent/converters/` | Conversores por tipo de tarea; `sql_flavor.py` (SqlServer vs AzureSql); `data_flow/classification.py` decide Copy vs Mapping Data Flow (Copy solo si es 1 origen + 1 destino y nada más) |
 | `ssis_adf_agent/naming.py` | Nombres de linked services: `LS_<ConnectionManager>` |
 | `scripts/deploy_azure.ps1` | Despliegue completo en Azure (ACR + Container Apps + Storage) |
 | `docs/DEPLOY_AZURE.md` | Guía de despliegue paso a paso y conexión de clientes |
-| `samples/` | `CargaVentas.dtsx`, `CargaClientes.dtsx` de ejemplo |
-| `tests/` | `test_conversion.py`, `test_remote.py` (Azurite) |
+| `samples/` | `CargaVentas.dtsx`, `CargaClientes.dtsx`, `ActualizarClientes.dtsx` (OLE DB Command) de ejemplo |
+| `tests/` | `test_conversion.py`, `test_dataflow_components.py`, `test_remote.py` (Azurite) |
 
 ## Comandos
 

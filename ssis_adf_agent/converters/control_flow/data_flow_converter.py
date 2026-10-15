@@ -1,9 +1,11 @@
 """
 Data Flow Task → ADF Copy Activity + Mapping Data Flow Activity.
 
-For simple single-source → single-destination flows with no intermediate
-transformations, a Copy Activity is generated (cheaper, faster, no Spark overhead).
-For flows with transformations, a Mapping Data Flow activity is generated.
+For flows that are exactly one source → one destination with no other component,
+a Copy Activity is generated (cheaper, faster, no Spark overhead). Anything else --
+including components that cannot be converted or are not recognised -- becomes a
+Mapping Data Flow activity, so no component is silently dropped (see
+converters/data_flow/classification.py).
 The actual Mapping Data Flow JSON is produced by generators/dataflow_generator.py.
 
 Copy Activity patterns follow Microsoft best practices:
@@ -25,36 +27,8 @@ from ...parsers.models import (
     SSISTask,
 )
 from ..base_converter import BaseConverter
+from ..data_flow.classification import is_destination, is_source, needs_mapping_data_flow
 from ..sql_flavor import flavor_for
-
-# Component types treated as "pure source"
-_SOURCE_TYPES = frozenset({
-    "OleDbSource", "FlatFileSource", "ExcelSource", "OdbcSource",
-    "ADONetSource", "SqlServerSource",
-})
-
-# Component types treated as "pure destination"
-_DEST_TYPES = frozenset({
-    "OleDbDestination", "FlatFileDestination", "ExcelDestination",
-    "OdbcDestination", "ADONetDestination", "SqlServerDestination",
-    "RecordsetDestination",
-})
-
-# Component types that are pure transformations
-_TRANSFORM_TYPES = frozenset({
-    "Lookup", "DerivedColumn", "ConditionalSplit", "Multicast", "UnionAll",
-    "Aggregate", "Sort", "MergeJoin", "Merge", "DataConversion",
-    "CharacterMap", "RowCount", "FuzzyLookup", "FuzzyGrouping",
-    "TermExtraction", "TermLookup", "ScriptComponent", "Cache",
-})
-
-
-def _is_simple_copy(task: DataFlowTask) -> bool:
-    """True if the data flow has exactly one source and one destination, no transforms."""
-    sources = [c for c in task.components if c.component_type in _SOURCE_TYPES]
-    dests = [c for c in task.components if c.component_type in _DEST_TYPES]
-    transforms = [c for c in task.components if c.component_type in _TRANSFORM_TYPES]
-    return len(sources) == 1 and len(dests) == 1 and len(transforms) == 0
 
 
 def _source_query(src: DataFlowComponent | None) -> str | None:
@@ -91,16 +65,29 @@ class DataFlowConverter(BaseConverter):
         depends_on = self._depends_on(task, constraints, task_by_id)
         safe_name = task.name.replace(" ", "_")
 
-        if _is_simple_copy(task):
-            return [self._copy_activity(task, safe_name, depends_on)]
-        else:
+        if not task.components:
+            return [self._empty_placeholder(task, depends_on)]
+        if needs_mapping_data_flow(task):
             return [self._mapping_dataflow_activity(task, safe_name, depends_on)]
+        return [self._copy_activity(task, safe_name, depends_on)]
+
+    def _empty_placeholder(self, task: DataFlowTask, depends_on: list) -> dict[str, Any]:
+        return {
+            "name": task.name,
+            "description": (
+                "[MANUAL REVIEW] SSIS Data Flow Task has no components (or none could be "
+                "parsed); nothing was converted. " + (task.description or "")
+            ).strip(),
+            "type": "Wait",
+            "dependsOn": depends_on,
+            "typeProperties": {"waitTimeInSeconds": 1},
+        }
 
     def _copy_activity(
         self, task: DataFlowTask, safe_name: str, depends_on: list
     ) -> dict[str, Any]:
-        src = next((c for c in task.components if c.component_type in _SOURCE_TYPES), None)
-        dst = next((c for c in task.components if c.component_type in _DEST_TYPES), None)
+        src = next((c for c in task.components if is_source(c)), None)
+        dst = next((c for c in task.components if is_destination(c)), None)
 
         src_flavor = flavor_for(src.connection_id if src else None, self._connections_by_id)
         dst_flavor = flavor_for(dst.connection_id if dst else None, self._connections_by_id)

@@ -166,7 +166,7 @@ The `samples/` directory is intended as a convenient drop zone for `.dtsx` files
 
 3. For output, create a directory alongside `samples/` (e.g. `adf_output/`) to keep generated artifacts separate from source packages.
 
-> `samples/` contains two small hand-written packages used by the test suite. Put your own packages in `samples/local/`, which is ignored by Git, so proprietary SSIS files are never committed.
+> `samples/` contains a few small hand-written packages used by the test suite. Put your own packages in `samples/local/`, which is ignored by Git, so proprietary SSIS files are never committed.
 
 ---
 
